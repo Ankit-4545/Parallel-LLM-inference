@@ -1,0 +1,159 @@
+// Wire protocol for the pipeline-parallel inference system.
+//
+// Data path per decode step:  Coordinator -> Stage 0 -> Stage 1 -> (back up the call chain) -> Coordinator
+// Every stage message carries (request_id, attempt, step) per item and the
+// epoch of every stage, so that late, duplicated or pre-crash messages can be
+// identified and discarded.
+//
+// Regenerate the Python bindings with:  bash scripts/gen_proto.sh
+
+syntax = "proto3";
+
+package pllm;
+
+// ---------------------------------------------------------------------------
+// Tensors
+// ---------------------------------------------------------------------------
+
+// A dense tensor in row-major (C) order, little-endian.
+message Tensor {
+  repeated int64 shape = 1;
+  string dtype = 2;   // "float32" | "float16" | "bfloat16" | "int64" | ...
+  bytes data = 3;     // raw bytes, len = prod(shape) * itemsize
+}
+
+// ---------------------------------------------------------------------------
+// Stage (worker) service
+// ---------------------------------------------------------------------------
+
+enum ItemStatus {
+  OK = 0;
+  STALE_EPOCH = 1;            // message epoch < worker epoch (pre-crash message)
+  FUTURE_EPOCH = 2;           // message epoch > worker epoch (message meant for a newer incarnation)
+  STALE_STEP = 3;             // (request_id, attempt, step) older than what was already applied
+  OUT_OF_ORDER = 4;           // step skips ahead of the next expected step
+  STALE_ATTEMPT = 5;          // message belongs to a replay attempt that has been superseded
+  UNKNOWN_REQUEST = 6;        // no KV cache for this request (e.g. worker restarted) -> coordinator must replay
+  REQUEST_CLOSED = 7;         // request already completed / released on this worker
+  CACHE_FULL = 8;             // KV-cache capacity reached
+  QUEUE_FULL = 9;             // worker input queue is full (backpressure)
+  DOWNSTREAM_UNAVAILABLE = 10;// the next stage could not be reached
+  INTERNAL_ERROR = 11;
+}
+
+// One request's contribution to a micro-batch.
+message StageItem {
+  string request_id = 1;
+  int64 step = 2;            // index of the generated token this item will produce (0 = prefill)
+  int64 attempt = 3;         // replay attempt; incremented by the coordinator on every cache rebuild
+  bool reset = 4;            // drop any cached state and rebuild from the supplied tokens (prefill/replay)
+  bool use_cache = 5;        // false = KV cache disabled: recompute the full sequence, keep no state
+  bool release_after = 6;    // last step of the request: free the cache after computing
+  repeated int64 token_ids = 7; // stage 0 input: new tokens (whole prompt on prefill, last token on decode)
+  Tensor hidden = 8;         // stage >= 1 input: activations [n_new_tokens, hidden_size]
+}
+
+message ItemResult {
+  string request_id = 1;
+  int64 step = 2;
+  int64 attempt = 3;
+  ItemStatus status = 4;
+  int64 token_id = 5;        // only set by the last stage
+  Tensor hidden = 6;         // internal: output activations of a non-final stage
+  bool replayed = 7;         // true if served from the idempotency cache (duplicate delivery)
+  string detail = 8;
+}
+
+message StageTiming {
+  int32 stage = 1;
+  double queue_ms = 2;       // time spent waiting for the compute thread
+  double compute_ms = 3;     // forward pass time
+  double deserialize_ms = 4;
+  double serialize_ms = 5;
+  double downstream_ms = 6;  // time waiting for the next stage RPC (includes its work + network)
+  int64 bytes_in = 7;        // serialized size of the request received by this stage
+  int64 bytes_out = 8;       // serialized size of the request sent to the next stage
+  double link_delay_ms = 9;  // artificial delay injected on the outgoing link
+}
+
+message ForwardRequest {
+  repeated int64 stage_epochs = 1;  // the epoch the sender believes each stage has
+  int64 batch_id = 2;
+  repeated StageItem items = 3;
+}
+
+message ForwardResponse {
+  repeated ItemResult results = 1;
+  repeated StageTiming timings = 2;
+  int64 worker_epoch = 3;    // epoch of the stage that produced this response
+}
+
+message HealthRequest {}
+message HealthResponse {
+  int32 stage = 1;
+  int64 epoch = 2;
+  int32 pid = 3;
+  int32 queue_depth = 4;
+  int32 cached_requests = 5;
+  bool ready = 6;
+}
+
+message ReleaseRequest { repeated string request_ids = 1; }
+message ReleaseResponse { int32 released = 1; }
+
+// Admin / observability messages carry JSON to keep the schema small.
+message JsonRequest { string json = 1; }
+message JsonResponse { string json = 1; }
+
+service StageService {
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  rpc Stats(JsonRequest) returns (JsonResponse);       // {"reset": true} resets counters
+  rpc Configure(JsonRequest) returns (JsonResponse);   // fault/delay injection, e.g. {"link_delay_ms": 5}
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator (client-facing) service
+// ---------------------------------------------------------------------------
+
+enum RequestStatus {
+  RUNNING = 0;
+  COMPLETED = 1;
+  OVERLOADED = 2;   // explicit rejection by admission control
+  TIMEOUT = 3;
+  CANCELLED = 4;
+  FAILED = 5;       // unrecoverable failure (e.g. worker could not be recovered before the deadline)
+  INVALID = 6;
+}
+
+message GenerateRequest {
+  string request_id = 1;            // client-chosen id (optional, echoed back)
+  string prompt = 2;                // text prompt (tokenized by the coordinator) ...
+  repeated int64 prompt_token_ids = 3; // ... or pre-tokenized prompt (takes precedence)
+  int32 max_new_tokens = 4;
+  double timeout_s = 5;             // request-level timeout (0 = coordinator default)
+}
+
+// Streamed back to the client: one message per token, then one final message.
+message GenerateChunk {
+  string request_id = 1;
+  int64 step = 2;
+  int64 token_id = 3;
+  string text = 4;                  // decoded text of this token
+  RequestStatus status = 5;         // RUNNING for token chunks; terminal status on the final chunk
+  bool final = 6;
+  string detail = 7;
+  double ttft_ms = 8;               // set on final chunk
+  double total_ms = 9;              // set on final chunk
+  repeated int64 token_ids = 10;    // set on final chunk: the full generated sequence
+}
+
+message CancelRequest { string request_id = 1; }
+message CancelResponse { bool cancelled = 1; }
+
+service CoordinatorService {
+  rpc Generate(GenerateRequest) returns (stream GenerateChunk);
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+  rpc Stats(JsonRequest) returns (JsonResponse);
+}
