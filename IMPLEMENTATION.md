@@ -37,28 +37,27 @@ design decisions and trade-offs, including what was left out. For setup and comm
 
 ## 2. Architecture
 
-```
-                   GenerateRequest (prompt / token ids, max_new_tokens)           stream GenerateChunk
-   Client  ───────────────────────────────────────────────►  Coordinator  ────────────────────────────►  Client
- (pllm/client.py)                                          (pllm/coordinator.py)
-                                                             │  admission queue (bounded)
-                                                             │  active set (bounded)  ── ready deque ──► micro-batch
-                                                             │  heartbeats ─────────────┐
-                                                             ▼                          │
-                                         Forward(ForwardRequest: epochs, items[token ids])
-                                                             │                          │
-                                                ┌────────────▼───────────┐              │
-                                                │ Worker 1 = stage 0     │◄─────────────┤ Health
-                                                │ wte+wpe, blocks 0-5    │              │
-                                                │ KV cache (its layers)  │              │
-                                                └────────────┬───────────┘              │
-                                         Forward(ForwardRequest: epochs, items[hidden]) │
-                                                ┌────────────▼───────────┐              │
-                                                │ Worker 2 = stage 1     │◄─────────────┘ Health
-                                                │ blocks 6-11, ln_f, head│
-                                                │ KV cache (its layers)  │
-                                                └────────────┬───────────┘
-                                   ForwardResponse(token ids) returns along the call chain
+```mermaid
+flowchart TD
+    C(["Client<br/><i>pllm/client.py</i>"])
+
+    subgraph CO["Coordinator · pllm/coordinator.py · port 50050"]
+        direction TB
+        AQ["Admission queue (bounded)"] --> AS["Active set (bounded)"]
+        AS -- "ready deque" --> MB["Micro-batch"]
+        HB["Heartbeats"]
+    end
+
+    W1["<b>Worker 1 = stage 0</b> · port 50051<br/>wte + wpe, blocks 0-5<br/>KV cache (its layers)"]
+    W2["<b>Worker 2 = stage 1</b> · port 50052<br/>blocks 6-11, ln_f, head<br/>KV cache (its layers)"]
+
+    C <== "↓ GenerateRequest (prompt / token ids, max_new_tokens)<br/>↑ stream GenerateChunk" ==> AQ
+    MB -- "Forward(ForwardRequest:<br/>epochs, items[token ids])" --> W1
+    W1 -- "Forward(ForwardRequest:<br/>epochs, items[hidden])" --> W2
+    W2 -. "ForwardResponse(token ids)" .-> W1
+    W1 -. "ForwardResponse(token ids)" .-> MB
+    HB -. "Health" .-> W1
+    HB -. "Health" .-> W2
 ```
 
 Each decode step follows **Coordinator → Worker 1 → Worker 2 → Coordinator**. The coordinator calls

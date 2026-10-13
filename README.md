@@ -8,28 +8,38 @@ agreement with single-process greedy decoding.
 
 * Objectives: `Parallel_LLM_Inference_Objectives.pdf`
 * How the code is built, file by file: **[IMPLEMENTATION.md](IMPLEMENTATION.md)**
+* What each file does and how data is processed inside it: **[CODE_WALKTHROUGH.md](CODE_WALKTHROUGH.md)**
 * Benchmark numbers: `benchmarks/results/summary.md`, written by the benchmark command (§5)
 
 ---
 
 ## 1. Architecture
 
+```mermaid
+flowchart TD
+    C(["Client"])
+
+    subgraph CO["Coordinator · port 50050"]
+        direction TB
+        AQ["Bounded admission queue"] --> AS["Bounded active set"]
+        AS --> MB["Micro-batcher<br/>max size / max wait<br/>≤ N batches in flight"]
+        HB["Heartbeats every 100 ms<br/>epochs · replay-based recovery"]
+    end
+
+    W1["<b>Worker 1 = stage 0</b> · port 50051<br/>token + position embeddings<br/>blocks 0-5 · KV cache"]
+    W2["<b>Worker 2 = stage 1</b> · port 50052<br/>blocks 6-11 · ln_f · LM head (greedy argmax)<br/>KV cache"]
+
+    C <== "↓ Generate(prompt, max_new_tokens)<br/>↑ stream of tokens" ==> AQ
+    MB -- "Forward(epochs, [request_id, attempt, step, token ids])" --> W1
+    W1 -- "Forward(epochs, [request_id, attempt, step, hidden [n,768]])" --> W2
+    W2 -. "token ids" .-> W1
+    W1 -. "token ids" .-> MB
+    HB -. "Health" .-> W1
+    HB -. "Health" .-> W2
 ```
- Client ──Generate(prompt, max_new_tokens)──► Coordinator ──stream of tokens──► Client
-                                                 │  bounded admission queue → bounded active set
-                                                 │  micro-batches (max size / max wait), ≤ N batches in flight
-                                                 │  heartbeats every 100 ms, epochs, replay-based recovery
-                                                 ▼
-                         Forward(epochs, [request_id, attempt, step, token ids])
-                                     Worker 1 = stage 0  (port 50051)
-                                     token+position embeddings, blocks 0-5, KV cache
-                                                 ▼
-                         Forward(epochs, [request_id, attempt, step, hidden [n,768]])
-                                     Worker 2 = stage 1  (port 50052)
-                                     blocks 6-11, ln_f, LM head (greedy argmax), KV cache
-                                                 │
-                          token ids return up the call chain to the coordinator
-```
+
+The thick two-way arrow is the client's `Generate` call and the token stream that comes back on it. Solid
+arrows are `Forward` calls, and dotted arrows are replies and health checks.
 
 Each decode step follows **Coordinator → Worker 1 → Worker 2 → Coordinator**. All three are separate OS
 processes with their own ports. By default the coordinator spawns and supervises the two workers.
