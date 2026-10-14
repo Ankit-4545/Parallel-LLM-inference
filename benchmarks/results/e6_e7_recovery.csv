@@ -1,0 +1,7 @@
+stage,rep,requests,max_new_tokens,tokens_before_kill,old_epoch,new_epoch,result,completed,correct,duplicate_tokens,missing_tokens,detect_ms,restart_ms,replay_ms,total_recovery_ms,heartbeat_gap_ms,affected_requests,discarded_stale_epoch_batches,wall_s
+0,0,12,32,115,1,2,recovered,12,12,0,0,557.136,1498.92,217.97,2274.03,616.746,12,0,4.15703
+0,1,12,32,115,2,3,recovered,12,12,0,0,580.618,1250.26,185.012,2015.88,615.602,12,0,3.90991
+0,2,12,32,115,3,4,recovered,12,12,0,0,596.944,1499.3,214.807,2311.06,613.137,12,0,4.23014
+1,0,12,32,115,1,2,recovered,12,12,0,0,553.138,1248.73,189.458,1991.33,613.324,12,0,3.86779
+1,1,12,32,115,2,3,recovered,12,12,0,0,519.717,1400.22,204.873,2124.81,612.185,12,0,4.02487
+1,2,12,32,115,3,4,recovered,12,12,0,0,572.539,1392.95,206.652,2172.14,617.189,12,0,4.11374

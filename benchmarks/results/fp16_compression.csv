@@ -1,0 +1,7 @@
+activation_dtype,rep,correct_rate,token_accuracy,mean_first_divergence,activation_bytes_per_token,wire_bytes_per_token,itl_ms_mean,ttft_ms_mean
+float32,0,1,1,32,5067.97,5257.99,22.4854,37.162
+float32,1,1,1,32,5068.14,5258.29,22.5108,36.4284
+float32,2,1,1,32,5068.14,5258.29,22.5513,36.3055
+float16,0,1,1,32,2567.96,2757.93,22.7199,37.4443
+float16,1,1,1,32,2568.12,2758.3,22.5268,36.3632
+float16,2,1,1,32,2568.12,2758.28,22.4789,36.196

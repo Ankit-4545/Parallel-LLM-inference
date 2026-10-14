@@ -1,0 +1,253 @@
+{
+  "kills": [
+    {
+      "stage": 0,
+      "rep": 0,
+      "requests": 12,
+      "max_new_tokens": 32,
+      "tokens_before_kill": 115,
+      "old_epoch": 1,
+      "new_epoch": 2,
+      "result": "recovered",
+      "completed": 12,
+      "correct": 12,
+      "duplicate_tokens": 0,
+      "missing_tokens": 0,
+      "detect_ms": 557.1359167806804,
+      "restart_ms": 1498.924917075783,
+      "replay_ms": 217.9699579719454,
+      "total_recovery_ms": 2274.030791828409,
+      "heartbeat_gap_ms": 616.7462079320103,
+      "affected_requests": 12,
+      "discarded_stale_epoch_batches": 0,
+      "wall_s": 4.157032583141699
+    },
+    {
+      "stage": 0,
+      "rep": 1,
+      "requests": 12,
+      "max_new_tokens": 32,
+      "tokens_before_kill": 115,
+      "old_epoch": 2,
+      "new_epoch": 3,
+      "result": "recovered",
+      "completed": 12,
+      "correct": 12,
+      "duplicate_tokens": 0,
+      "missing_tokens": 0,
+      "detect_ms": 580.6176250334829,
+      "restart_ms": 1250.2552920486778,
+      "replay_ms": 185.011750087142,
+      "total_recovery_ms": 2015.8846671693027,
+      "heartbeat_gap_ms": 615.6022909563035,
+      "affected_requests": 12,
+      "discarded_stale_epoch_batches": 0,
+      "wall_s": 3.9099148749373853
+    },
+    {
+      "stage": 0,
+      "rep": 2,
+      "requests": 12,
+      "max_new_tokens": 32,
+      "tokens_before_kill": 115,
+      "old_epoch": 3,
+      "new_epoch": 4,
+      "result": "recovered",
+      "completed": 12,
+      "correct": 12,
+      "duplicate_tokens": 0,
+      "missing_tokens": 0,
+      "detect_ms": 596.9443330541253,
+      "restart_ms": 1499.3040000554174,
+      "replay_ms": 214.8069168906659,
+      "total_recovery_ms": 2311.0552500002086,
+      "heartbeat_gap_ms": 613.136500120163,
+      "affected_requests": 12,
+      "discarded_stale_epoch_batches": 0,
+      "wall_s": 4.230144332861528
+    },
+    {
+      "stage": 1,
+      "rep": 0,
+      "requests": 12,
+      "max_new_tokens": 32,
+      "tokens_before_kill": 115,
+      "old_epoch": 1,
+      "new_epoch": 2,
+      "result": "recovered",
+      "completed": 12,
+      "correct": 12,
+      "duplicate_tokens": 0,
+      "missing_tokens": 0,
+      "detect_ms": 553.1377079896629,
+      "restart_ms": 1248.731791973114,
+      "replay_ms": 189.45804191753268,
+      "total_recovery_ms": 1991.3275418803096,
+      "heartbeat_gap_ms": 613.3241660427302,
+      "affected_requests": 12,
+      "discarded_stale_epoch_batches": 0,
+      "wall_s": 3.867786667076871
+    },
+    {
+      "stage": 1,
+      "rep": 1,
+      "requests": 12,
+      "max_new_tokens": 32,
+      "tokens_before_kill": 115,
+      "old_epoch": 2,
+      "new_epoch": 3,
+      "result": "recovered",
+      "completed": 12,
+      "correct": 12,
+      "duplicate_tokens": 0,
+      "missing_tokens": 0,
+      "detect_ms": 519.7167498990893,
+      "restart_ms": 1400.2177501097322,
+      "replay_ms": 204.87308409065008,
+      "total_recovery_ms": 2124.8075840994716,
+      "heartbeat_gap_ms": 612.1845829766244,
+      "affected_requests": 12,
+      "discarded_stale_epoch_batches": 0,
+      "wall_s": 4.024868624983355
+    },
+    {
+      "stage": 1,
+      "rep": 2,
+      "requests": 12,
+      "max_new_tokens": 32,
+      "tokens_before_kill": 115,
+      "old_epoch": 3,
+      "new_epoch": 4,
+      "result": "recovered",
+      "completed": 12,
+      "correct": 12,
+      "duplicate_tokens": 0,
+      "missing_tokens": 0,
+      "detect_ms": 572.539082961157,
+      "restart_ms": 1392.9526251740754,
+      "replay_ms": 206.65245782583952,
+      "total_recovery_ms": 2172.144165961072,
+      "heartbeat_gap_ms": 617.1891668345779,
+      "affected_requests": 12,
+      "discarded_stale_epoch_batches": 0,
+      "wall_s": 4.113737291889265
+    }
+  ],
+  "stale_epoch_injection": [
+    {
+      "injected_epochs": [
+        1,
+        1
+      ],
+      "current_epochs": [
+        2,
+        1
+      ],
+      "status": "STALE_EPOCH",
+      "detail": "stage 0 epoch 2, message epoch [1, 1]",
+      "rejected": true,
+      "killed_stage": 0
+    },
+    {
+      "injected_epochs": [
+        1,
+        1
+      ],
+      "current_epochs": [
+        1,
+        2
+      ],
+      "status": "STALE_EPOCH",
+      "detail": "stage 1 epoch 2, message epoch [1, 1]",
+      "rejected": true,
+      "killed_stage": 1
+    }
+  ],
+  "e8_stale_epoch": {
+    "injected_epochs": [
+      1,
+      1
+    ],
+    "current_epochs": [
+      1,
+      2
+    ],
+    "status": "STALE_EPOCH",
+    "detail": "stage 1 epoch 2, message epoch [1, 1]",
+    "rejected": true
+  },
+  "e8_direct_duplicates": {
+    "tokens": [
+      11,
+      314,
+      1101,
+      7926,
+      11,
+      475
+    ],
+    "reference": [
+      11,
+      314,
+      1101,
+      7926,
+      11,
+      475
+    ],
+    "match": true,
+    "duplicates": [
+      {
+        "step": 1,
+        "first": 314,
+        "dup_status": "OK",
+        "dup_replayed": true,
+        "dup_token": 314
+      },
+      {
+        "step": 2,
+        "first": 1101,
+        "dup_status": "OK",
+        "dup_replayed": true,
+        "dup_token": 1101
+      },
+      {
+        "step": 3,
+        "first": 7926,
+        "dup_status": "OK",
+        "dup_replayed": true,
+        "dup_token": 7926
+      },
+      {
+        "step": 4,
+        "first": 11,
+        "dup_status": "OK",
+        "dup_replayed": true,
+        "dup_token": 11
+      },
+      {
+        "step": 5,
+        "first": 475,
+        "dup_status": "OK",
+        "dup_replayed": true,
+        "dup_token": 475
+      }
+    ],
+    "late_old_step_status": "STALE_STEP",
+    "all_duplicates_idempotent": true
+  },
+  "e8_duplicate_dispatch": {
+    "requests": 16,
+    "completed": 16,
+    "correct": 16,
+    "duplicate_tokens": 0,
+    "duplicates_sent": 65,
+    "discarded_duplicate_results": 505,
+    "worker_idempotent_replays": [
+      512,
+      512
+    ],
+    "worker_rejections": [
+      {},
+      {}
+    ]
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "requests": 400,
+  "offered_rate_rps": 40.0,
+  "max_new_tokens": 32,
+  "statuses": {
+    "COMPLETED": 96,
+    "OVERLOADED": 304
+  },
+  "rejection_rate": 0.76,
+  "completed": 96,
+  "completed_correct": 96,
+  "hung": 0,
+  "max_rejection_latency_ms": 1.5803331043571234,
+  "mean_rejection_latency_ms": 0.9842409406126919,
+  "max_admission_depth": 16,
+  "admission_capacity": 16,
+  "max_active": 16,
+  "active_capacity": 16,
+  "worker_max_queue_depth": [
+    2,
+    2
+  ],
+  "worker_queue_size": [
+    8,
+    8
+  ],
+  "rss_mb_min_max": {
+    "coordinator_rss_mb": [
+      236.34375,
+      238.4375
+    ],
+    "s0_rss_mb": [
+      287.390625,
+      549.015625
+    ],
+    "s1_rss_mb": [
+      286.140625,
+      689.40625
+    ]
+  },
+  "goodput_tok_s": 229.59181456204738
+}

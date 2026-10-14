@@ -6,6 +6,11 @@ micro-batches and pipelines decode steps, keeps per-request KV caches consistent
 crash (SIGKILL) without returning stale, duplicate or wrong tokens. Correctness means token-for-token
 agreement with single-process greedy decoding.
 
+**Highlights** (measured on an 8-core Apple Silicon laptop, CPU only; details in [§6](#6-results)):
+**100%** token-exact output in every experiment · **8.2×** throughput from micro-batching and pipelining
+(44 → 359 tok/s) · **2.0×** faster decoding with the KV cache · **≈2.1 s** recovery from a worker SIGKILL with
+**0** duplicate or lost tokens · overload rejected in **≈1 ms** with **0** hung requests.
+
 * Objectives: `Parallel_LLM_Inference_Objectives.pdf`
 * How the code is built, file by file: **[IMPLEMENTATION.md](IMPLEMENTATION.md)**
 * What each file does and how data is processed inside it: **[CODE_WALKTHROUGH.md](CODE_WALKTHROUGH.md)**
@@ -245,16 +250,54 @@ overhead. That split shows where the bottleneck is.
 
 ## 6. Results
 
-This repository was written without access to the target machine's runtime: no results are committed yet.
-After `python -m benchmarks.run_all`, copy the headline numbers from `benchmarks/results/summary.md` into
-this section. Every number there can be regenerated with that one command:
+**Test machine:** Apple Silicon (arm64), 8 CPUs, macOS, Python 3.11.9, torch 2.11.0, 4 torch threads per
+process, no GPU. Every configuration ran 3 times, and the values are means. All three processes ran on the
+same machine, so the "network" is loopback. The full tables are in `benchmarks/results/summary.md`, and
+`python -m benchmarks.run_all` regenerates them.
 
-* E1: the distributed inter-token latency overhead per token compared with the baseline;
-* E2: the KV-cache speed-up;
-* E3 and E4: the best throughput, and its ratio to the unbatched pipeline and to the baseline;
-* E6 and E7: the mean recovery time;
-* correctness: the exact-match rate, which must be 100%;
-* the bottleneck explanation.
+### Headline numbers
+
+| What | Result | Experiment |
+|---|---|---|
+| Correctness | **100%** of responses token-exact against the single-process baseline, in every experiment | all |
+| Distributed overhead | **+2.89 ms** per decoded token (25.2 vs 22.3 ms, 1.13×); about 5 KB on the wire per token | E1 |
+| KV cache | **2.00×** faster decoding (44.4 → 22.2 ms per token) | E2 |
+| Throughput | **359 tok/s** at batch 16 with pipelining: **8.2×** the unbatched, unpipelined pipeline (43.8 tok/s) | E4 |
+| Concurrency | 45 → 249 tok/s from 1 to 16 concurrent requests, flat afterwards at the default batch cap of 8 | E3 |
+| Crash recovery | **2.20 s** (worker 1) and **2.10 s** (worker 2) mean; 72/72 responses exact, **0** duplicate, **0** missing tokens | E6, E7 |
+| Overload | 400 requests at 40 req/s: 96 completed (all exact), 304 rejected in **≈1 ms**, **0** hung, queues within bounds | E5 |
+| Stale and duplicate messages | every stale-epoch message rejected; 505 duplicate results discarded, **0** duplicate tokens emitted | E8 |
+| fp16 activations | half the bytes per token (5068 → 2568 B) with 100% token accuracy | stretch |
+
+### Findings
+
+* **The system is compute-bound.** In a pipeline step, compute takes 93-97% of the time, (de)serialisation
+  under 0.5%, and RPC/network/event-loop overhead 3-7%. Shrinking activations (fp16) therefore does not
+  change latency on one machine.
+* **Stage 1 is the bottleneck stage.** With pipelining, stage 1 runs at 96-99% utilisation and stage 0 at
+  68-81%. Stage 1 also computes `ln_f` and the LM head, a 768 × 50257 matrix multiply.
+* **Pipelining hides network delay.** With 20 ms of added one-way delay between the workers, throughput at
+  32 concurrent requests falls 34% (180 → 119 tok/s) with 1 batch in flight, but stays flat (242 → 238 tok/s)
+  with 4 in flight.
+* **Recovery time is mostly process restart.** Of the ≈2.1 s, detection takes ≈0.56 s (the 0.6 s failure
+  timeout), restarting the worker and loading its weights ≈1.4 s, and replaying the KV caches ≈0.2 s. A warm
+  standby worker would remove most of the restart time.
+
+### Plots
+
+**Recovery after a worker SIGKILL (E6, E7)**
+
+![Recovery timeline](benchmarks/plots/e6_e7_recovery_timeline.png)
+
+**Throughput vs concurrency (E3)**
+
+![Throughput vs concurrency](benchmarks/plots/e3_throughput_vs_concurrency.png)
+
+**KV cache on vs off (E2)**
+
+![KV cache](benchmarks/plots/e2_kv_cache.png)
+
+The other plots are in `benchmarks/plots/`.
 
 ## 7. Design decisions and trade-offs (short version)
 
