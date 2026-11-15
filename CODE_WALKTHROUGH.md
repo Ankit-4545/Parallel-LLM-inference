@@ -64,16 +64,21 @@ sequenceDiagram
 7. **The reply travels back.** Stage 0 copies stage 1's result into its own reply, and the coordinator gets
    one `ForwardResponse` with the token and per-stage timings.
 8. **Coordinator emits.** [`_process_response`](pllm/coordinator.py#L333) checks that the result belongs to
-   this batch, attempt and step, then [`_accept`](pllm/coordinator.py#L397) appends the token, pushes a
-   `GenerateChunk` to the request's event queue, and marks the request ready again.
+   this batch, attempt and step. With `--request-log` it first commits the batch's tokens to SQLite
+   (`_commit_tokens`). Then [`_accept`](pllm/coordinator.py#L397) appends the token, sets the request's
+   `changed` event (so its `Generate` stream sends a `GenerateChunk`), and marks the request ready again.
 9. **Steps 1..31 are decodes.** Each sends only the last generated token. Each stage appends one position
    to its cache. On step 31, `release_after=True` makes both workers free the cache.
-10. **Finish.** [`_finish`](pllm/coordinator.py#L209) pushes a final chunk with `COMPLETED`, the full token
-    list and timings. The `Generate` stream ends.
+10. **Finish.** [`_finish`](pllm/coordinator.py#L209) records `COMPLETED` (and, with a request log, commits
+    it), and the stream sends a final chunk with the full token list and timings. The `Generate` stream ends.
 
 If a worker dies at any point, the heartbeat loop notices, restarts it with a higher **epoch**, and every
 active request replays `prompt + generated tokens` to rebuild its caches. See
 [`coordinator.py` → failure handling](#pllmcoordinatorpy).
+
+If the **coordinator** dies, a new one started with the same `--request-log` rebuilds the unfinished requests
+from the log, adopts the workers (`--detach-workers`) or spawns new ones, and replays. Clients re-attach with
+`Resume`. See [`pllm/request_log.py`](#pllmrequest_logpy) and IMPLEMENTATION.md §9a.
 
 ---
 
@@ -287,12 +292,13 @@ Two services:
 
 | Service                | RPC           | Used by                           | What it carries                                                                                                |
 | ---------------------- | ------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `StageService`       | `Forward`   | coordinator → stage 0 → stage 1 | `ForwardRequest{stage_epochs, batch_id, items[]}` → `ForwardResponse{results[], timings[], worker_epoch}` |
-|                        | `Health`    | coordinator heartbeats            | stage, epoch, pid, queue depth, cached requests                                                                |
-|                        | `Release`   | coordinator on cancel/timeout     | list of request ids to free                                                                                    |
+| `StageService`       | `Forward`   | coordinator → stage 0 → stage 1 | `ForwardRequest{stage_epochs, batch_id, items[], coordinator_epoch}` → `ForwardResponse{results[], timings[], worker_epoch}` |
+|                        | `Health`    | coordinator heartbeats            | request: `coordinator_epoch`; reply: stage, epoch, pid, queue depth, cached requests, highest coordinator epoch seen, `num_stages`, `split` |
+|                        | `Release`   | coordinator on cancel/timeout/restore | list of request ids to free, `coordinator_epoch`                                                          |
 |                        | `Stats`     | coordinator, benchmarks           | JSON counters (optional reset)                                                                                 |
 |                        | `Configure` | benchmarks (E9)                   | JSON: link delay, bandwidth, wire dtype                                                                        |
 | `CoordinatorService` | `Generate`  | clients                           | `GenerateRequest` → stream of `GenerateChunk` (one per token, then a final one)                           |
+|                        | `Resume`    | clients after a broken stream     | `ResumeRequest{request_id, from_step}` → stream of the tokens from `from_step`, then the final chunk        |
 |                        | `Cancel`    | clients                           | request id                                                                                                     |
 |                        | `Stats`     | clients, benchmarks               | JSON coordinator stats (+ worker stats)                                                                        |
 
@@ -305,9 +311,10 @@ Key messages:
 * **`StageTiming`**: per-stage queue, compute, (de)serialisation and downstream time, plus bytes in and out.
 * **`ItemStatus`** values (`OK`, `STALE_EPOCH`, `FUTURE_EPOCH`, `STALE_STEP`, `OUT_OF_ORDER`,
   `STALE_ATTEMPT`, `UNKNOWN_REQUEST`, `REQUEST_CLOSED`, `CACHE_FULL`, `QUEUE_FULL`,
-  `DOWNSTREAM_UNAVAILABLE`, `INTERNAL_ERROR`) are how workers tell the coordinator what went wrong.
-* **`RequestStatus`** (`RUNNING`, `COMPLETED`, `OVERLOADED`, `TIMEOUT`, `CANCELLED`, `FAILED`, `INVALID`)
-  is what clients see.
+  `DOWNSTREAM_UNAVAILABLE`, `INTERNAL_ERROR`, `STALE_COORDINATOR`) are how workers tell the coordinator what
+  went wrong. `STALE_COORDINATOR` means a newer coordinator incarnation has taken over.
+* **`RequestStatus`** (`RUNNING`, `COMPLETED`, `OVERLOADED`, `TIMEOUT`, `CANCELLED`, `FAILED`, `INVALID`,
+  `NOT_FOUND`) is what clients see. `NOT_FOUND` answers a `Resume` for an unknown request.
 
 ### `pllm/stage_executor.py`
 
@@ -370,8 +377,12 @@ the next stage.
 2. `set_determinism()`, resolve the model dir, compute this stage's layer range, and load the
    `StageModule` with only its weights.
 3. Create a `StageServicer`, start an `grpc.aio` server on the port, and log `READY`.
-4. Install SIGINT/SIGTERM handlers. If `--parent-pid` is set, a background task checks every second that
-   the parent (the coordinator) is still alive and shuts the worker down if not.
+4. Install SIGINT/SIGTERM handlers. If `--parent-pid` is set, a background task checks every 0.2 s that
+   the parent (the coordinator) is still alive and shuts the worker down if not. If `--orphan-timeout` is
+   set instead (detached workers), the worker shuts down after that long without any `Forward` or heartbeat
+   from a coordinator.
+5. `--coordinator-epoch` sets the lowest coordinator epoch the worker accepts, so a worker spawned by a new
+   coordinator never obeys the old one.
 
 **[`StageServicer`](pllm/worker.py#L55) state:** a `StageExecutor`, a `ThreadPoolExecutor(max_workers=1)`
 (the single compute thread), a gRPC stub to the next stage (if any), the `pending` counter for
@@ -421,6 +432,23 @@ backpressure, and counters for stats.
 * `kill()` sends a signal (SIGKILL by default) and waits; [`restart()`](pllm/supervisor.py#L88) is
   `kill` + `spawn` with a new epoch.
 * `stop_all()` sends SIGTERM to all, waits, then kills stragglers and closes log files.
+* **Detached mode** (`WorkerSpec.detached`, `--detach-workers`): `spawn` passes `--orphan-timeout` instead of
+  `--parent-pid` and starts the worker in its own session, so it outlives the coordinator. `adopt(stage, pid,
+  epoch)` takes over a worker that an earlier coordinator started. `kill`, `alive`, `pid` and `stop_all` work
+  on adopted pids through `kill_pid` / `pid_alive`. New workers get `--coordinator-epoch`.
+
+### `pllm/request_log.py`
+
+**Purpose:** the durable log that lets a restarted coordinator continue the requests of the one that crashed.
+
+* SQLite in WAL mode; tables `meta`, `requests` and `tokens`. All calls are synchronous, on the event loop.
+* `take_over(min_epoch)` raises the stored coordinator epoch and makes this object its owner. Every later
+  write transaction (`_Txn`) first checks that the stored epoch is still its own, and raises `FencedError`
+  otherwise.
+* Writes: `start()` (a new request), `record(tokens, finished)` (one micro-batch, one transaction),
+  `finish()`, `set_wire_ids()`, `gc()` (finished requests older than the retention period).
+* Reads: `unfinished()` (what to restore), `lookup(client_id)` (for `Resume`), `counts()`. Token lists are
+  read in step order and cut at the first gap.
 
 ### `pllm/coordinator.py`
 
@@ -431,23 +459,34 @@ failure detection and recovery.
 
 Each request has an internal uuid (used on the wire, never reused), the client's id, prompt, generated
 tokens, `next_step`, `attempt`, `needs_reset` (true at first, because step 0 is a prefill),
-`in_flight_batch`, an `asyncio.Queue` of output chunks, timestamps, a deadline and retry counters.
+`in_flight_batch`, a `changed` event (set on every new token and on finish), the flags `logged`,
+`logged_final` and `restored` used by the request log, timestamps, a deadline and retry counters.
 [`mark_reset()`](pllm/coordinator.py#L85) sets `needs_reset` and increments `attempt`.
 
 **Startup ([`serve()`](pllm/coordinator.py#L676) → [`Coordinator.start()`](pllm/coordinator.py#L139))**
 
 1. Make sure the weights are downloaded (workers run offline), load the tokenizer.
-2. If no `--worker-addrs` were given, create a `WorkerSupervisor` and spawn all workers with epoch 1.
-3. Open a channel and stub to each stage and poll `Health` until every stage is up with the expected epoch.
-4. Start three background tasks: `_scheduler_loop`, `_health_loop` and `_reaper_loop`.
-5. Start the gRPC server and print `COORDINATOR READY` (which `LocalCluster` waits for).
+2. Take a coordinator epoch: wall-clock ms, or with `--request-log` `RequestLog.take_over()`, which also makes
+   it the owner of the log.
+3. Open a channel and stub to each stage. If no `--worker-addrs` were given,
+   [`_adopt_or_spawn()`](pllm/coordinator.py) pings each worker port: with `--detach-workers` a compatible
+   running worker is adopted; anything else is killed and a new worker is spawned with a higher epoch.
+   Then poll `Health` until every stage is up with the expected epoch.
+4. With a request log, [`_restore_from_log()`](pllm/coordinator.py) rebuilds the unfinished requests (new
+   wire ids, old ones released, `needs_reset=True`).
+5. Start three background tasks: `_scheduler_loop`, `_health_loop` and `_reaper_loop`.
+6. Start the gRPC server and print `COORDINATOR READY` (which `LocalCluster` waits for).
 
 **Admission**
 
 * [`Generate`](pllm/coordinator.py#L621) validates input (prompt not empty, `prompt + max_new_tokens <= 1024`, request id not in use) and calls [`submit()`](pllm/coordinator.py#L175). If the admission deque is
   full, `submit` raises `OverloadedError` and the client gets one final `OVERLOADED` chunk.
-* Otherwise `Generate` loops on `r.events.get()` and yields each chunk until the final one. Its `finally`
-  block cancels the request if the client went away early.
+* With `--request-log`, `submit()` writes the request to the log before admitting it.
+* Otherwise `Generate` streams through `_stream(r, 0)`: it sends every token from the given step on, waits on
+  `r.changed` for more, and sends the final chunk once the request is done. Its `finally` block cancels the
+  request if the client went away early.
+* `Resume(request_id, from_step)` uses the same `_stream` for a request in memory (e.g. one restored after a
+  restart), or replays a finished request from the log; an unknown id gets `NOT_FOUND`.
 * [`_admit()`](pllm/coordinator.py#L190), called at the top of every scheduler iteration, moves requests
   from the admission deque into `active` (up to `max_active`) and appends them to `ready`.
 
@@ -483,8 +522,10 @@ Each iteration:
 3. For each `ItemResult`:
    * ignore it if the request is done, belongs to a different batch, or this is a duplicate dispatch;
    * ignore it if `step` or `attempt` do not match what the request expects;
-   * `OK` → [`_accept`](pllm/coordinator.py#L397): append the token, record timing, push a
-     `GenerateChunk`, then either finish (`COMPLETED`) or mark ready again;
+   * `OK` → collected; after the loop the batch's tokens are committed to the request log
+     (`_commit_tokens`), then [`_accept`](pllm/coordinator.py#L397) appends each token, records timing,
+     sets `changed`, then either finishes (`COMPLETED`) or marks the request ready again;
+   * `STALE_COORDINATOR` → this coordinator has been replaced: `_fence()`;
    * connectivity statuses (`DOWNSTREAM_UNAVAILABLE`, `STALE_EPOCH`, `FUTURE_EPOCH`) → retry with backoff;
    * otherwise count a retry; past `max_retries` → `FAILED`;
    * "worker lost the cache" statuses (`UNKNOWN_REQUEST`, `REQUEST_CLOSED`, `STALE_ATTEMPT`,
@@ -510,6 +551,12 @@ Each iteration:
 * Each request's next item is now a replay of `prompt + generated` with the new attempt number. Both
   stages rebuild their caches. When the replay's token is accepted, [`_replay_done`](pllm/coordinator.py#L543)
   marks it complete in the recovery event, which then gets detection, restart and replay durations.
+* **Fencing.** [`_fence(reason)`](pllm/coordinator.py) runs when a heartbeat reply shows a higher coordinator
+  epoch, a worker answers `STALE_COORDINATOR`, or a log write raises `FencedError`. It fails every stream with
+  `FAILED` "coordinator superseded" (clients then resume on the new coordinator), does not touch the log or
+  the workers, and makes `serve()` exit.
+* **Shutdown.** SIGINT/SIGTERM is deliberate: requests end `CANCELLED` (recorded in the log) and the workers,
+  adopted ones included, are stopped. Only a crash leaves work for the next incarnation.
 
 **Housekeeping**
 
@@ -526,6 +573,9 @@ Each iteration:
 
 **Purpose:** a small async client library and CLI.
 
+* `generate(stub, ..., reconnect_s=N)`: with N > 0, a broken stream is re-attached with
+  `Resume(request_id, len(tokens))` for up to N seconds, and `reconnects`, `broken_at` and `resumed_at`
+  record it (E10). Without it the behaviour is unchanged.
 * [`generate(stub, ...)`](pllm/client.py#L54) sends a `GenerateRequest` and iterates the stream. For each
   token chunk it appends the token, records the client-side arrival time and calls `on_token`. On the final
   chunk it stores status, detail, server timings and the full token list. `cancel_after=N` cancels the
@@ -544,6 +594,8 @@ Each iteration:
   background thread copies its output to `logs/<name>.log` and sets an event when it sees
   `COORDINATOR READY`. Startup fails if the process exits or the timeout passes.
 * `stop()` sends SIGTERM (the coordinator then stops its workers), and kills after 15 s.
+* `kill()` SIGKILLs the coordinator (its workers are left alone) and `restart()` starts a new incarnation with
+  the same arguments (E10). `stop()` also reaps any worker still listening on the cluster's ports.
 * Used as a context manager: `with LocalCluster(port=..., extra=[...]) as c: ...`.
 * Helpers: `stats()` / `astats()`, `worker_pid(stage)` (from coordinator stats), `worker_addr(stage)`.
   `load_reference()` reads `reference_outputs.json`.
@@ -626,6 +678,18 @@ Real processes and gRPC on localhost, through `LocalCluster`:
 * overload (admission queue 4) gives only `COMPLETED` or `OVERLOADED`, with nothing hanging;
 * `--no-kv-cache` cluster still matches the reference.
 
+### `tests/test_request_log.py`
+
+The request log on its own: requests survive a reopen, duplicate token rows are ignored, a gap is never
+resumed, `take_over` fences the previous owner's writes, a reused client id starts clean, GC removes only old
+finished requests. It also checks that `StageExecutor` rejects an older coordinator epoch.
+
+### `tests/test_coordinator_recovery.py` (marked `slow`)
+
+SIGKILL the coordinator mid-generation and restart it with the same log, once with workers adopted (same
+pids) and once respawned; every reconnecting client gets the reference tokens. Also: a finished request is
+still resumable after a restart, and a SIGSTOPped coordinator that is replaced exits after SIGCONT.
+
 ---
 
 ## 5. `scripts/`
@@ -652,7 +716,7 @@ A terminal demo in three acts:
 5. Print `PASS` if every queue stayed within its bound, nothing hung, and every completed request matched
    the reference.
 
-### `scripts/fault_inject.py` (experiments E6, E7, E8)
+### `scripts/fault_inject.py` (experiments E6, E7, E8, E10)
 
 * **`kill` mode** ([`kill_run`](scripts/fault_inject.py#L39)): start a workload of concurrent requests,
   poll stats until a set fraction of tokens is generated, SIGKILL the chosen worker, wait for the workload
@@ -667,6 +731,11 @@ A terminal demo in three acts:
      duplicate is answered with `replayed=True` and the same token, and that a late old step is rejected;
   3. `duplicate_dispatch_run`: run a cluster with `--duplicate-dispatch` and check there are no duplicate
      tokens.
+* **`coordinator` mode** (E10, `coordinator_kill_run`): reconnecting clients, SIGKILL the coordinator after a
+  set fraction of tokens, restart it with the same `--request-log`, and split the time from the kill into new
+  process, init, worker adoption or spawn, log load, serving and replay. It runs with `--detach-workers`
+  (adopt) and without (respawn). `request_log_overhead` then compares no log, `normal` and `full` sync. Writes
+  `e10_coordinator_recovery.csv`, `e10_timeline.csv`, `e10_marks.csv` and `e10_log_overhead.csv`.
 * Results are merged into `benchmarks/results/e6_e8_fault_summary.json`; the script prints `PASS` or
   `FAIL`.
 
@@ -757,7 +826,7 @@ Empty package marker, so `python -m benchmarks.run_all` works.
 flowchart LR
     subgraph ENTRY["Entry points"]
         direction TB
-        TD["tests/test_distributed.py"]
+        TD["tests/test_distributed.py<br/>tests/test_coordinator_recovery.py"]
         RA["benchmarks/run_all.py"]
         LT["scripts/load_test.py"]
         FI["scripts/fault_inject.py"]
@@ -776,6 +845,7 @@ flowchart LR
         direction TB
         CO["coordinator.py"]
         SUP["supervisor.py"]
+        RL["request_log.py<br/>(SQLite file)"]
     end
 
     subgraph WORKER["Worker process (one per stage)"]
@@ -804,8 +874,8 @@ flowchart LR
 
     CLU == "starts (child process)" ==> CO
     CLI -. "gRPC" .-> CO
-    CO --> SUP
-    SUP == "spawns" ==> WK
+    CO --> SUP & RL
+    SUP == "spawns or adopts" ==> WK
     CO -. "gRPC" .-> WK
 
     WK --> SE & SER
@@ -826,4 +896,4 @@ their main users are drawn.
 * **Inside a worker:** `worker.py` (networking, threads) → `stage_executor.py` (rules, state) →
   `partition.py` (math) + `kv_cache.py` (storage); `serialization.py` at the edges.
 * **Inside the coordinator:** `coordinator.py` (admission, scheduling, recovery) → `supervisor.py`
-  (process management).
+  (process management) + `request_log.py` (durable state for coordinator restarts).

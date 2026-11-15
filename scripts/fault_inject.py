@@ -3,6 +3,7 @@
     python scripts/fault_inject.py kill --stage 0 --reps 3   # E6: SIGKILL worker 1 (stage 0) mid-generation
     python scripts/fault_inject.py kill --stage 1 --reps 3   # E7: SIGKILL worker 2 (stage 1) mid-generation
     python scripts/fault_inject.py stale                     # E8: inject pre-crash-epoch + duplicate messages
+    python scripts/fault_inject.py coordinator --reps 3      # E10: SIGKILL the coordinator, restart it, resume
     python scripts/fault_inject.py all                       # everything above
 
 Each kill run streams several concurrent requests, SIGKILLs the worker process
@@ -11,6 +12,12 @@ response is token-for-token identical to reference_outputs.json (no duplicate,
 missing or wrong tokens). Recovery time is split into detection (kill -> worker
 declared dead), restart (-> new incarnation healthy) and replay (-> every
 affected request has rebuilt its KV cache and produced its next token).
+
+E10 SIGKILLs the *coordinator* instead, then plays the role of systemd and
+starts a new incarnation with the same --request-log. Clients reconnect with
+Resume. It runs twice: workers adopted (--detach-workers) and workers respawned
+(attached workers die with their coordinator), and also measures what the
+request log costs during normal operation.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import asyncio
 import json
 import os
 import signal
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -157,6 +165,113 @@ async def duplicate_dispatch_run(n_requests=16, n=32) -> dict:
             "worker_rejections": [w.get("rejected") for w in s["workers"]]}
 
 
+async def coordinator_kill_run(c, variant: str, rep: int, n_requests: int, n: int, kill_frac: float):
+    """E10: SIGKILL the coordinator mid-generation, restart it, let clients Resume."""
+    from pllm.client import channel, generate
+    from pllm.proto import pipeline_pb2_grpc as pb_grpc
+
+    entries = entries_for(n_requests)
+    before = await get_stats(c.addr, workers=False)
+    base_tokens = before["counters"].get("tokens_generated", 0)
+    target = int(kill_frac * n_requests * n)
+    async with channel(c.addr) as ch:
+        stub = pb_grpc.CoordinatorServiceStub(ch)
+        tasks = [asyncio.create_task(generate(stub, prompt_ids=e["prompt_token_ids"], max_new_tokens=n,
+                                              request_id=f"e10-{variant}-{rep}-{i}", reconnect_s=120))
+                 for i, e in enumerate(entries)]
+        while True:
+            s = await get_stats(c.addr, workers=False)
+            if s["counters"].get("tokens_generated", 0) - base_tokens >= target:
+                break
+            await asyncio.sleep(0.005)
+        t_kill_mono = time.monotonic()
+        t_kill = await asyncio.to_thread(c.kill)
+        await asyncio.to_thread(c.restart)          # what systemd / launchd would do
+        results = await asyncio.gather(*tasks)
+    after = await get_stats(c.addr, workers=True)
+    st = after["startup"]
+    ms = lambda t: (t - t_kill) * 1e3 if t else None  # noqa: E731
+    ok, done = correctness(results, entries, n)
+    gaps = [(r.resumed_at[0] - r.broken_at[0]) * 1e3 for r in results if r.resumed_at and r.broken_at]
+    row = {
+        "variant": variant, "rep": rep, "requests": n_requests, "max_new_tokens": n,
+        "tokens_before_kill": st.get("restored_tokens"), "restored_requests": st.get("restored"),
+        "completed": done, "correct": ok,
+        "duplicate_tokens": sum(max(0, len(r.tokens) - n) for r in results),
+        "missing_tokens": sum(max(0, n - len(r.tokens)) for r in results if r.status == "COMPLETED"),
+        "reconnects": sum(r.reconnects for r in results),
+        "adopted_stages": len(st.get("adopted_stages", [])), "spawned_stages": len(st.get("spawned_stages", [])),
+        "process_start_ms": ms(st.get("process_start")),
+        "init_ms": (st["start_called"] - st["process_start"]) * 1e3,          # interpreter + imports + tokenizer
+        "workers_ms": (st["workers_ready"] - st["start_called"]) * 1e3,       # adopt (ping) or spawn + load weights
+        "log_load_ms": st.get("log_load_ms"),
+        "serving_ms": ms(st.get("serving")),
+        "replay_ms": (st["replayed"] - st["serving"]) * 1e3 if st.get("replayed") else None,
+        "total_recovery_ms": ms(st.get("replayed")),
+        "client_gap_ms_mean": statistics.fmean(gaps) if gaps else None,
+        "client_gap_ms_max": max(gaps) if gaps else None,
+        "pids_kept": after["worker_pids"] == before["worker_pids"],
+    }
+    timeline = [{"variant": variant, "rep": rep, "request": i, "step": step, "t_ms": (t - t_kill_mono) * 1e3}
+                for i, r in enumerate(results) for step, t in enumerate(r.token_times)]
+    marks = {"variant": variant, "rep": rep, "kill_ms": 0.0, "process_start_ms": row["process_start_ms"],
+             "workers_ready_ms": ms(st.get("workers_ready")), "serving_ms": row["serving_ms"],
+             "replayed_ms": row["total_recovery_ms"]}
+    return row, timeline, marks
+
+
+async def run_coordinator_kills(reps, n_requests, n, kill_frac):
+    rows, timeline, marks = [], [], []
+    tmp = RESULTS_DIR / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    for variant, flags in (("adopt", ["--detach-workers"]), ("respawn", [])):
+        db = tmp / f"e10_{variant}.db"
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(db) + suffix).unlink(missing_ok=True)
+        with cluster(f"e10_{variant}", ["--max-batch-size", "8", "--request-log", str(db), *flags],
+                     port_offset=80) as c:
+            for rep in range(reps):
+                row, tl, mk = await coordinator_kill_run(c, variant, rep, n_requests, n, kill_frac)
+                rows.append(row)
+                timeline += tl
+                marks.append(mk)
+                print(json.dumps(row))
+                await asyncio.sleep(0.5)
+    return rows, timeline, marks
+
+
+async def request_log_overhead(reps, n=32):
+    """What durability costs while nothing fails: no log vs WAL/NORMAL vs WAL/FULL (+F_FULLFSYNC)."""
+    from benchmarks.common import result_metrics
+
+    rows = []
+    tmp = RESULTS_DIR / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    for mode in ("none", "normal", "full"):
+        db = tmp / f"e10_overhead_{mode}.db"
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(db) + suffix).unlink(missing_ok=True)
+        extra = ["--max-batch-size", "8"] + ([] if mode == "none" else
+                                             ["--request-log", str(db), "--request-log-sync", mode])
+        with cluster(f"e10_overhead_{mode}", extra, port_offset=90) as c:
+            await run_workload(c.addr, entries_for(4), 8)          # warm-up
+            for rep in range(reps):
+                single, w1 = await run_workload(c.addr, entries_for(8), n, concurrency=1)
+                await get_stats(c.addr, reset=True, workers=False)
+                conc, w32 = await run_workload(c.addr, entries_for(32), n)
+                s = await get_stats(c.addr, workers=False)
+                m1 = result_metrics(single, entries_for(8), n, w1)
+                m32 = result_metrics(conc, entries_for(32), n, w32)
+                lg = s.get("request_log") or {}
+                row = {"log_mode": mode, "rep": rep, "single_itl_ms_mean": m1["itl_ms_mean"],
+                       "conc32_throughput_tok_s": m32["throughput_tok_s"], "conc32_itl_ms_p50": m32["itl_ms_p50"],
+                       "correct_rate": (m1["correct"] + m32["correct"]) / 40,
+                       "commit_ms_mean": lg.get("mean_commit_ms"), "commit_ms_max": lg.get("max_commit_ms")}
+                rows.append(row)
+                print(json.dumps(row))
+    return rows
+
+
 async def run_kills(stages, reps, n_requests, n, kill_frac):
     rows, timeline, marks, stale = [], [], [], []
     for stage in stages:
@@ -178,7 +293,7 @@ async def run_kills(stages, reps, n_requests, n, kill_frac):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["kill", "stale", "all"])
+    ap.add_argument("mode", choices=["kill", "stale", "coordinator", "all"])
     ap.add_argument("--stage", type=int, choices=[0, 1], default=None, help="stage to kill (default: both)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--requests", type=int, default=12)
@@ -225,6 +340,20 @@ def main(argv=None) -> int:
         print(json.dumps({"stale": stale, "duplicates": dups, "duplicate_dispatch": dd}, indent=2))
         ok &= stale["rejected"] and dups["match"] and dups["all_duplicates_idempotent"]
         ok &= dd["correct"] == dd["requests"] and dd["duplicate_tokens"] == 0
+    if a.mode in ("coordinator", "all"):
+        rows, timeline, marks = asyncio.run(run_coordinator_kills(a.reps, a.requests, a.max_new_tokens, a.kill_at))
+        write_csv("e10_coordinator_recovery.csv", rows)
+        write_csv("e10_timeline.csv", timeline)
+        write_csv("e10_marks.csv", marks)
+        overhead = asyncio.run(request_log_overhead(a.reps))
+        write_csv("e10_log_overhead.csv", overhead)
+        ok &= all(r["correct"] == r["requests"] and r["duplicate_tokens"] == 0 and r["missing_tokens"] == 0
+                  for r in rows)
+        ok &= all(r["correct_rate"] == 1.0 for r in overhead)
+        if a.plot:
+            from benchmarks.plots import plot_e10
+
+            plot_e10()
     prev = {}
     path = RESULTS_DIR / "e6_e8_fault_summary.json"
     if path.exists():

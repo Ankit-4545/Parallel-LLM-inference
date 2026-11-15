@@ -3,13 +3,16 @@
 A pipeline-parallel inference system for GPT-2 small (124M). The model's 12 transformer blocks are split
 across **two worker processes** that exchange activations over **gRPC**. A **coordinator** admits requests,
 micro-batches and pipelines decode steps, keeps per-request KV caches consistent, and recovers from a worker
-crash (SIGKILL) without returning stale, duplicate or wrong tokens. Correctness means token-for-token
+crash (SIGKILL) without returning stale, duplicate or wrong tokens. With `--request-log` it also survives a crash
+of the **coordinator itself**: a restarted coordinator adopts the running workers and resumes every unfinished
+request from a SQLite log. Correctness means token-for-token
 agreement with single-process greedy decoding.
 
 **Highlights** (measured on an 8-core Apple Silicon laptop, CPU only; details in [§6](#6-results)):
 **100%** token-exact output in every experiment · **8.2×** throughput from micro-batching and pipelining
 (44 → 359 tok/s) · **2.0×** faster decoding with the KV cache · **≈2.1 s** recovery from a worker SIGKILL with
-**0** duplicate or lost tokens · overload rejected in **≈1 ms** with **0** hung requests.
+**0** duplicate or lost tokens · overload rejected in **≈1 ms** with **0** hung requests · coordinator SIGKILL
+→ every request resumed in **≈0.5 s** with workers adopted (≈2.7 s if they are respawned), token-exact.
 
 * Objectives: `Parallel_LLM_Inference_Objectives.pdf`
 * How the code is built, file by file: **[IMPLEMENTATION.md](IMPLEMENTATION.md)**
@@ -71,6 +74,11 @@ processes with their own ports. By default the coordinator spawns and supervises
 * **Overload.** When the admission queue is full, a request gets an immediate `OVERLOADED` final message: it
   is never silently dropped and never hangs. Coordinator queues, worker input queues and KV caches all have
   hard bounds, so memory stays flat under sustained overload.
+* **Coordinator crash (with `--request-log`).** Every accepted request and every token is committed to a SQLite
+  log *before* it is streamed, so the log always holds at least what any client has seen. A restarted
+  coordinator rebuilds each unfinished request from `prompt + logged tokens` and continues it. Clients re-attach
+  with `Resume(request_id, tokens_received)` and get exactly the missing tokens. A coordinator that was replaced
+  while frozen is fenced out of the workers and the log by a higher **coordinator epoch** and shuts itself down.
 * **Unrecoverable failure.** If a worker cannot be restarted, or a request cannot rebuild its state within
   `--recovery-deadline` (default 30 s), the request ends with an explicit `FAILED` status and a reason.
   `--request-timeout` gives `TIMEOUT`, and a client cancel gives `CANCELLED`. In every case the caches are
@@ -79,13 +87,24 @@ processes with their own ports. By default the coordinator spawns and supervises
 ### Failure model and assumptions
 
 * Crash-stop failures of worker processes, and dropped or delayed RPCs. Byzantine behaviour is out of scope.
-* The coordinator is a single point of failure: it is not replicated.
+* The coordinator is not replicated. Without `--request-log` its crash loses the in-flight requests. With it,
+  something outside the coordinator (systemd, launchd, a shell loop, the E10 script) must start a new
+  incarnation on the same port and the same log file. There is no hot standby, so requests pause until the
+  restart (≈0.5 s with `--detach-workers`).
 * Detection: a worker is declared dead after `--failure-timeout` (default 0.6 s) without a successful
   heartbeat.
 * Recovery:
   1. Restart the worker with a **higher epoch**, then discard everything stamped with the old epoch.
   2. Replay `prompt + generated tokens` under a new attempt number to rebuild both stages' KV caches.
   3. Continue generation.
+* Coordinator restart:
+  1. Take a new coordinator epoch (stored in the log; wall-clock milliseconds, so it always increases) and
+     announce it in every heartbeat and `Forward`. Workers reject older coordinators with `STALE_COORDINATOR`,
+     and the log rejects their writes.
+  2. With `--detach-workers`, adopt the workers that are still running. Otherwise spawn new ones with
+     higher stage epochs.
+  3. Give every unfinished request a new wire id (releasing the caches held under the old one) and replay it
+     as in worker recovery.
 * Messages are idempotent on `(request_id, attempt, step)`. A duplicate is answered from the stage's
   idempotency cache instead of being applied twice. Stale and out-of-order messages are rejected with an
   explicit status.
@@ -154,6 +173,11 @@ Useful coordinator flags (`python -m pllm.coordinator --help` lists them all):
 | `--recovery-deadline`, `--request-timeout` | 30 s, 300 s | explicit failure / timeout |
 | `--activation-dtype float16` | float32 | compressed activations (lossy, stretch goal) |
 | `--duplicate-dispatch` | off | fault injection: send every micro-batch twice |
+| `--request-log PATH` | off | SQLite log for coordinator crash recovery |
+| `--request-log-sync` | `normal` | `normal` survives a process crash; `full` (+`fullfsync`) also a power loss, at ≈4 ms per commit |
+| `--request-log-retention` | 600 s | how long a finished request stays resumable |
+| `--detach-workers` | off | spawned workers outlive the coordinator and are adopted by the next one |
+| `--worker-orphan-timeout` | 300 s | a detached worker exits after this long without any coordinator |
 
 **Workers on two machines.** Start the workers yourself, then point the coordinator at them:
 
@@ -168,6 +192,24 @@ python -m pllm.coordinator --worker-addrs A:50051,B:50052
 In this mode each worker's epoch defaults to its start time in milliseconds. If you restart a crashed
 worker (by hand or with systemd), it comes back with a higher epoch, and the coordinator detects this and
 replays.
+
+**Surviving a coordinator crash.** Run the coordinator with a request log and detached workers under anything
+that restarts it, and let clients reconnect:
+
+```bash
+# Terminal 1: restart the coordinator whenever it crashes (systemd Restart=on-failure / launchd KeepAlive in
+# production). A clean exit (Ctrl-C, status 0) ends the loop; a crash (e.g. SIGKILL, status 137) restarts it.
+until python -m pllm.coordinator --request-log coordinator.db --detach-workers; do sleep 0.2; done
+
+# Terminal 2: a client that re-attaches with Resume if its stream breaks
+python -m pllm.client --prompt "The capital of France is" --max-new-tokens 200 --request-id r1 --reconnect 60
+
+# Terminal 3: crash the coordinator mid-generation; the client pauses ~0.5 s and continues where it was
+pkill -9 -f "pllm.coordinator"
+```
+
+`Ctrl-C`/SIGTERM is a deliberate shutdown, not a crash: the coordinator cancels its requests (and records that)
+and stops its workers.
 
 **Demo** (O9: normal generation, overload, and a worker kill with recovery, in one terminal):
 
@@ -192,6 +234,8 @@ pytest                      # everything
 | `tests/test_partition.py` | split vs full logits ≤ 1e-5 and identical greedy tokens; other splits (3 and 4 stages, auto); each stage holds its share of the weights (O2) |
 | `tests/test_serialization.py` | bit-exact tensor round trip, including NaN, ±inf, -0.0, bf16 and non-contiguous tensors (O3) |
 | `tests/test_kv_cache.py` | cache on = off = reference; cache is faster; interleaved requests never mix; mixed prefill/decode batches; out-of-order, stale and duplicate steps; replay attempts; epochs; release; capacity and TTL (O4, O7) |
+| `tests/test_request_log.py` | request log survives reopen; duplicate token rows ignored; gaps never resumed; a new owner fences the old one's writes; client-id reuse; retention GC; workers reject an older coordinator epoch |
+| `tests/test_coordinator_recovery.py` | SIGKILL the coordinator mid-generation, restart, resume: token-exact with workers adopted (same pids) and respawned; a finished request is still resumable after a restart; a frozen-then-replaced coordinator is fenced out and exits |
 | `tests/test_distributed.py` | gRPC end to end: all prompts exact; 50 concurrent exact with bounded queues; cancel frees caches; timeout; SIGKILL of either worker → exact output; stale-epoch injection rejected; duplicate dispatch → no duplicate tokens; overload → explicit rejections; KV cache off over RPC (O3, O5, O7) |
 
 ---
@@ -231,6 +275,7 @@ python -m benchmarks.plots              # only rebuild plots + summary.md from e
 | E6 | Kill Worker 1 (stage 0) mid-generation | `python scripts/fault_inject.py kill --stage 0 --reps 3 --plot` | 12 concurrent requests; SIGKILL after 30% of tokens (`--kill-at`) | `e6_e7_recovery.csv`, `e6_e7_timeline.csv`, `plots/e6_e7_recovery_timeline.png` |
 | E7 | Kill Worker 2 (stage 1) mid-generation | `python scripts/fault_inject.py kill --stage 1 --reps 3 --plot` | as for E6. `--only e6` in `run_all` runs E6 and E7 | same files as E6 |
 | E8 | Stale-epoch and duplicate messages | `python scripts/fault_inject.py stale` (or `--only e8`) | crashes stage 1, then (a) injects a pre-crash-epoch message into the restarted pipeline, (b) delivers every step twice straight to the workers, (c) runs a `--duplicate-dispatch` cluster | `e6_e8_fault_summary.json` |
+| E10 | Kill the coordinator mid-generation | `python scripts/fault_inject.py coordinator --reps 3 --plot` (or `--only e10`) | 12 concurrent reconnecting clients; SIGKILL after 30% of tokens; the script restarts the coordinator with the same `--request-log`. Runs with workers adopted and respawned, then measures the log's cost with no log, `normal` and `full` sync | `e10_coordinator_recovery.csv`, `e10_timeline.csv`, `e10_log_overhead.csv`, `plots/e10_coordinator_recovery.png` |
 | E9 | Artificial network delay between workers | `python -m benchmarks.run_all --only e9` | delay set at run time through the worker `Configure` RPC (0 to 20 ms one-way on stage 0 → stage 1), with 1 and 4 batches in flight. By hand: `--link-delay-ms` on `pllm.worker` | `e9_network_delay.csv`, `plots/e9_network_delay.png` |
 | - | Prompt-length sweep (O8) | `python -m benchmarks.run_all --only plen` | synthetic prompts of 8, 64, 256 and 512 tokens; references computed on the fly by the baseline | `prompt_length.csv`, `plots/prompt_length_ttft.png` |
 | - | fp16 activation compression (stretch) | `python -m benchmarks.run_all --only fp16` | none | `fp16_compression.csv` |
@@ -267,6 +312,8 @@ same machine, so the "network" is loopback. The full tables are in `benchmarks/r
 | Crash recovery | **2.20 s** (worker 1) and **2.10 s** (worker 2) mean; 72/72 responses exact, **0** duplicate, **0** missing tokens | E6, E7 |
 | Overload | 400 requests at 40 req/s: 96 completed (all exact), 304 rejected in **≈1 ms**, **0** hung, queues within bounds | E5 |
 | Stale and duplicate messages | every stale-epoch message rejected; 505 duplicate results discarded, **0** duplicate tokens emitted | E8 |
+| Coordinator crash | **0.50 s** kill → every request resumed with workers adopted, **2.72 s** respawned; 72/72 exact, **0** duplicate, **0** missing tokens | E10 |
+| Request log cost | no measurable ITL or throughput change with `synchronous=NORMAL` (0.13 ms per commit); +4 ms ITL with `FULL` | E10 |
 | fp16 activations | half the bytes per token (5068 → 2568 B) with 100% token accuracy | stretch |
 
 ### Findings
@@ -282,6 +329,10 @@ same machine, so the "network" is loopback. The full tables are in `benchmarks/r
 * **Recovery time is mostly process restart.** Of the ≈2.1 s, detection takes ≈0.56 s (the 0.6 s failure
   timeout), restarting the worker and loading its weights ≈1.4 s, and replaying the KV caches ≈0.2 s. A warm
   standby worker would remove most of the restart time.
+* **Keeping the workers is what makes coordinator recovery fast.** After a coordinator SIGKILL, adopting the
+  running workers takes ≈3 ms instead of ≈1.8 s of spawning and weight loading, so recovery drops from 2.7 s
+  to 0.5 s. What is left is Python start-up and imports (≈0.3 s, after making `torch` a lazy import: the
+  coordinator never needs it) and replaying the caches (≈0.2 s). Reading the log takes under 2 ms.
 
 ### Plots
 
@@ -292,6 +343,10 @@ same machine, so the "network" is loopback. The full tables are in `benchmarks/r
 **Throughput vs concurrency (E3)**
 
 ![Throughput vs concurrency](benchmarks/plots/e3_throughput_vs_concurrency.png)
+
+**Coordinator SIGKILL, workers adopted vs respawned (E10)**
+
+![Coordinator recovery](benchmarks/plots/e10_coordinator_recovery.png)
 
 **KV cache on vs off (E2)**
 
@@ -313,11 +368,21 @@ Full discussion: [IMPLEMENTATION.md §11](IMPLEMENTATION.md#11-design-decisions-
   rather than 1/2. The transformer blocks are split exactly in half.
 * **Recovery replays prompt + generated tokens through both stages** under a new attempt number. This is
   simple and always correct, at the cost of recomputing the surviving stage's cache.
+* **Coordinator recovery restarts from a SQLite log instead of failing over.** SQLite is a library, not a
+  server, so there is nothing extra to run; tokens are committed before they are streamed. After a restart
+  even adopted workers' caches are rebuilt by replay (≈0.2 s) rather than reused, because a crash can leave
+  a step applied on stage 0 but not on stage 1.
+* **Workers die with the coordinator by default; `--detach-workers` keeps them.** Keeping them skips the
+  ≈1.8 s weight load (0.5 s instead of 2.7 s recovery, and the gap grows with model size). It is opt-in
+  because adopted workers keep running old code after a deploy, carry over any bad state, and hold memory
+  until the orphan timeout if no coordinator returns. When the coordinator dies mid-batch, a worker finishes
+  the compute already running, discards the result, and goes idle: it never blocks waiting.
 * **Left out:**
   * sampling and EOS early stopping;
   * tensor parallelism;
   * GPU support;
   * authentication;
   * chunked prefill;
-  * coordinator replication;
+  * coordinator replication (a hot standby): a coordinator crash is recovered by restarting it from the
+    request log, not by failing over;
   * other model architectures (TinyLlama, Qwen).

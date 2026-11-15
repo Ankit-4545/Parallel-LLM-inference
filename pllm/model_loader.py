@@ -12,10 +12,14 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-
-import torch
+from typing import TYPE_CHECKING
 
 from pllm.config import DEFAULT_SEED, MODEL_NAME, MODEL_REVISION
+
+if TYPE_CHECKING:
+    import torch
+# torch is imported lazily: the coordinator only needs resolve_model_dir, and importing torch
+# would add ~0.6 s to every coordinator (re)start.
 
 MODEL_FILES = [
     "config.json",
@@ -85,6 +89,7 @@ def snapshot_commit(model_dir: Path) -> str:
 
 def load_tensors(model_dir: Path, keys_filter) -> dict[str, torch.Tensor]:
     """Load only the tensors whose (normalised) name satisfies `keys_filter`."""
+    import torch
     from safetensors import safe_open
 
     out: dict[str, torch.Tensor] = {}
@@ -98,6 +103,8 @@ def load_tensors(model_dir: Path, keys_filter) -> dict[str, torch.Tensor]:
 
 def set_determinism(seed: int = DEFAULT_SEED, threads: int | None = None) -> None:
     """Seed every RNG and force deterministic kernels."""
+    import torch
+
     random.seed(seed)
     torch.manual_seed(seed)
     try:

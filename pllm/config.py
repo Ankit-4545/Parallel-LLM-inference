@@ -56,6 +56,8 @@ class WorkerConfig:
     activation_dtype: str = "float32"  # wire dtype for activations ("float16" = compression)
     link_delay_ms: float = 0.0       # artificial delay on the link to the next stage (experiment E9)
     parent_pid: int = 0              # exit when this process disappears (set when spawned by the coordinator)
+    coordinator_epoch: int = 0       # reject messages from coordinator incarnations older than this
+    orphan_timeout_s: float = 0.0    # >0: exit after this long without any coordinator contact
 
 
 @dataclass
@@ -95,6 +97,13 @@ class CoordinatorConfig:
 
     # Fault injection (experiment E8)
     duplicate_dispatch: bool = False  # re-send every micro-batch a second time
+
+    # Coordinator crash recovery (experiment E10)
+    request_log: str = ""            # SQLite file; "" = no durable log, a coordinator crash loses requests
+    request_log_sync: str = "normal"  # "normal" survives a process crash, "full" also a power loss
+    request_log_retention_s: float = 600.0  # finished requests stay resumable this long
+    detach_workers: bool = False     # spawned workers outlive the coordinator and are adopted on restart
+    worker_orphan_timeout_s: float = 300.0  # detached workers exit after this long without a coordinator
 
     def to_dict(self) -> dict:
         return asdict(self)

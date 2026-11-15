@@ -17,6 +17,12 @@ Responsibilities
 * Failure handling: heartbeats detect dead workers; the coordinator restarts
   them with a higher epoch, discards every response produced under an old
   epoch, and rebuilds KV caches by replaying prompt + generated tokens.
+* Coordinator crash recovery (--request-log): every accepted request and every
+  token is committed to a SQLite log before it is streamed. A restarted
+  coordinator takes a higher coordinator epoch (which fences the old
+  incarnation out of the workers and the log), adopts running workers
+  (--detach-workers) or spawns new ones, rebuilds the unfinished requests from
+  the log and continues them; clients re-attach with the Resume RPC.
 """
 
 from __future__ import annotations
@@ -30,6 +36,9 @@ import os
 import signal
 import time
 import uuid
+
+_PROCESS_START = time.time()  # wall clock, for coordinator restart timing (E10)
+
 from collections import deque
 
 import grpc
@@ -38,7 +47,8 @@ from pllm.config import GRPC_OPTIONS, CoordinatorConfig
 from pllm.metrics import Counter
 from pllm.proto import pipeline_pb2 as pb
 from pllm.proto import pipeline_pb2_grpc as pb_grpc
-from pllm.supervisor import WorkerSpec, WorkerSupervisor
+from pllm.request_log import FencedError, RequestLog
+from pllm.supervisor import WorkerSpec, WorkerSupervisor, kill_pid
 
 log = logging.getLogger("pllm.coordinator")
 
@@ -51,6 +61,10 @@ _TRANSIENT = {pb.QUEUE_FULL, pb.CACHE_FULL, pb.DOWNSTREAM_UNAVAILABLE, pb.INTERN
 # is the heartbeat monitor's job (and the recovery deadline bounds the wait), so these back off
 # but do not consume the per-request retry budget.
 _CONNECTIVITY = {pb.DOWNSTREAM_UNAVAILABLE, pb.STALE_EPOCH, pb.FUTURE_EPOCH}
+
+# Detail prefix of the FAILED status sent by a coordinator that a newer incarnation replaced.
+# Clients treat it like a broken stream: reconnect and Resume.
+SUPERSEDED = "coordinator superseded"
 
 
 class OverloadedError(Exception):
@@ -71,8 +85,12 @@ class Request:
         self.done = False
         self.status = pb.RUNNING
         self.detail = ""
-        self.events: asyncio.Queue = asyncio.Queue()
+        self.changed = asyncio.Event()      # set whenever a token is added or the request finishes
+        self.logged = False                 # has a row in the request log
+        self.logged_final = False           # terminal status already committed to the log
+        self.restored = False               # rebuilt from the log by a restarted coordinator
         self.t_submit = time.monotonic()
+        self.t_done: float | None = None
         self.t_admit: float | None = None
         self.t_first: float | None = None
         self.token_times: list[float] = []
@@ -99,7 +117,8 @@ class Coordinator:
             self.supervisor = WorkerSupervisor(WorkerSpec(
                 num_stages=n, split=cfg.split, base_port=cfg.worker_base_port, threads=cfg.worker_threads,
                 queue_size=cfg.worker_queue_size, max_cached_requests=cfg.worker_max_cached_requests,
-                activation_dtype=cfg.activation_dtype))
+                activation_dtype=cfg.activation_dtype, detached=cfg.detach_workers,
+                orphan_timeout_s=cfg.worker_orphan_timeout_s))
             self.addrs = self.supervisor.addrs()
         else:
             if len(cfg.worker_addrs) != n:
@@ -123,6 +142,15 @@ class Coordinator:
         self.last_heartbeat = [time.monotonic()] * n
         self.recovery_events: list[dict] = []
         self._open_recovery: dict | None = None
+        # Coordinator crash recovery
+        self.rlog: RequestLog | None = None
+        if cfg.request_log:
+            self.rlog = RequestLog(cfg.request_log, sync=cfg.request_log_sync,
+                                   retention_s=cfg.request_log_retention_s)
+        self.coord_epoch = 0
+        self.fenced = asyncio.Event()        # set when a newer coordinator incarnation took over
+        self.startup: dict = {}              # how this incarnation started (E10 timing)
+        self._restore_pending: set[str] = set()
         self.counters = Counter()
         self._reset_metrics()
 
@@ -137,36 +165,151 @@ class Coordinator:
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self, wait_ready_s: float = 120.0) -> None:
-        if self.supervisor is not None:
-            self.epochs = [1] * self.cfg.num_stages
-            self.supervisor.start_all(epoch=1)
+        cfg = self.cfg
+        st = self.startup = {"process_start": _PROCESS_START, "start_called": time.time()}
+        # Coordinator epoch: wall-clock ms, and strictly above every epoch recorded in the log, so it
+        # increases across restarts whether or not a log is used.
+        self.coord_epoch = int(time.time() * 1000)
+        logged_worker_epochs: list[int] = []
+        if self.rlog is not None:
+            self.coord_epoch = self.rlog.take_over(min_epoch=self.coord_epoch)
+            self.rlog.gc()
+            logged_worker_epochs = list(self.rlog.get_meta("worker_epochs", []) or [])
+        st["epoch"] = self.coord_epoch
         for a in self.addrs:
             ch = grpc.aio.insecure_channel(a, options=GRPC_OPTIONS)
             self.channels.append(ch)
             self.stubs.append(pb_grpc.StageServiceStub(ch))
         deadline = time.monotonic() + wait_ready_s
-        for s in range(self.cfg.num_stages):
-            epoch = await self._wait_healthy(s, self.epochs[s] if self.supervisor else None, deadline)
+        want: list[int | None] = [None] * cfg.num_stages
+        if self.supervisor is not None:
+            want = await self._adopt_or_spawn(logged_worker_epochs)
+        for s in range(cfg.num_stages):
+            epoch = await self._wait_healthy(s, want[s], deadline)
             if epoch is None:
                 raise RuntimeError(f"stage {s} at {self.addrs[s]} did not become healthy")
             self.epochs[s] = epoch
-        self.last_heartbeat = [time.monotonic()] * self.cfg.num_stages
+        st["workers_ready"] = time.time()
+        self._save_worker_epochs()
+        self.last_heartbeat = [time.monotonic()] * cfg.num_stages
         self._running = True
+        if self.rlog is not None:
+            await self._restore_from_log()
         self._tasks = [asyncio.create_task(self._scheduler_loop(), name="scheduler"),
                        asyncio.create_task(self._health_loop(), name="health"),
                        asyncio.create_task(self._reaper_loop(), name="reaper")]
-        log.info("coordinator ready: stages=%s epochs=%s", self.addrs, self.epochs)
+        log.info("coordinator ready: epoch=%d stages=%s epochs=%s", self.coord_epoch, self.addrs, self.epochs)
+
+    async def _adopt_or_spawn(self, logged_epochs: list[int]) -> list[int | None]:
+        """For every stage, adopt the worker already listening on its port (detached mode, left
+        behind by a previous coordinator incarnation) or spawn a new one with a higher epoch.
+        Returns the epoch to wait for per stage."""
+        cfg, sup = self.cfg, self.supervisor
+        sup.coordinator_epoch = self.coord_epoch
+        found = await asyncio.gather(*[self._ping(s, timeout=0.5) for s in range(cfg.num_stages)])
+        want: list[int | None] = [None] * cfg.num_stages
+        adopted, spawn = [], []
+        for s, h in enumerate(found):
+            compatible = (h is not None and h.ready and h.stage == s and h.num_stages == cfg.num_stages
+                          and h.split == cfg.split and h.coordinator_epoch <= self.coord_epoch)
+            if compatible and cfg.detach_workers:
+                sup.adopt(s, h.pid, h.epoch)
+                want[s] = h.epoch
+                adopted.append(s)
+                continue
+            if h is not None:
+                # A worker of an earlier incarnation still holds the port (attached workers exit
+                # within ~0.2 s of their parent; incompatible ones must go): crash-stop it.
+                log.warning("stage %d: replacing leftover worker pid %d (epoch %d)", s, h.pid, h.epoch)
+                await asyncio.get_running_loop().run_in_executor(None, kill_pid, h.pid)
+            prev = max(logged_epochs[s] if s < len(logged_epochs) else 0, h.epoch if h is not None else 0)
+            want[s] = prev + 1
+            spawn.append(s)
+        for s in sorted(spawn, reverse=True):  # last stage first, so earlier stages can connect to it
+            sup.spawn(s, want[s])
+        self.startup.update({"adopted_stages": adopted, "spawned_stages": sorted(spawn)})
+        if adopted:
+            log.info("adopted running workers for stages %s", adopted)
+        return want
+
+    def _save_worker_epochs(self) -> None:
+        if self.rlog is not None and not self.fenced.is_set():
+            try:
+                self.rlog.set_meta("worker_epochs", list(self.epochs))
+            except FencedError as e:
+                self._fence(str(e))
+
+    async def _restore_from_log(self) -> None:
+        """Rebuild every request that a previous incarnation accepted but did not finish."""
+        t0 = time.time()
+        logged = self.rlog.unfinished()
+        now_wall, now = time.time(), time.monotonic()
+        old_wire_ids, renamed, restored = [], [], []
+        for lr in logged:
+            r = Request(lr.client_id, lr.prompt, lr.max_new, max(0.0, lr.deadline - now_wall))
+            r.generated = list(lr.tokens)
+            r.next_step = len(r.generated)
+            r.logged = r.restored = True
+            self.by_client[r.client_id] = r
+            old_wire_ids.append(lr.wire_id)
+            renamed.append((r.client_id, r.id))
+            if r.next_step >= r.max_new:      # cannot normally happen: completion is logged with the last token
+                self._finish(r, pb.COMPLETED)
+            elif lr.deadline <= now_wall:
+                self._finish(r, pb.TIMEOUT, "request timeout (expired while the coordinator was down)")
+            else:
+                r.recovering_since = now
+                r.t_admit = now
+                if len(self.active) < self.cfg.max_active:
+                    self.active[r.id] = r
+                    self.ready.append(r)
+                else:
+                    self.admission.append(r)  # over capacity: queue it, do not reject restored work
+                self._restore_pending.add(r.id)
+                restored.append(r)
+        if renamed:
+            # New wire ids: caches that adopted workers still hold under the old ids belong to attempts
+            # this incarnation knows nothing about. Release them and start clean.
+            self.rlog.set_wire_ids(renamed)
+            await self._release_everywhere(old_wire_ids)
+        self.startup.update({
+            "log_loaded": time.time(), "log_load_ms": (time.time() - t0) * 1e3,
+            "restored": len(restored), "restored_tokens": sum(len(r.generated) for r in restored),
+            "restored_finished": len(logged) - len(restored)})
+        if not restored:
+            self.startup["replayed"] = time.time()
+        if logged:
+            log.warning("restored %d unfinished requests from %s (%d tokens already generated)",
+                        len(restored), self.rlog.path, self.startup["restored_tokens"])
+        self.counters["restored_requests"] += len(restored)
+        self._wake.set()
 
     async def stop(self) -> None:
         self._running = False
         for t in self._tasks:
             t.cancel()
+        # A replaced (fenced) coordinator must not touch the log or the workers: they belong
+        # to the new incarnation now.
+        fenced = self.fenced.is_set()
         for r in list(self.active.values()) + list(self.admission):
-            self._finish(r, pb.CANCELLED, "coordinator shutting down", release=False)
+            self._finish(r, pb.CANCELLED, "coordinator shutting down", release=False, log_it=not fenced)
         for ch in self.channels:
             await ch.close()
-        if self.supervisor is not None:
+        if self.supervisor is not None and not fenced:
             await asyncio.get_running_loop().run_in_executor(None, self.supervisor.stop_all)
+        if self.rlog is not None:
+            self.rlog.close()
+
+    def _fence(self, reason: str) -> None:
+        """A newer coordinator incarnation owns the workers and the log: stop immediately."""
+        if self.fenced.is_set():
+            return
+        log.error("%s: %s; shutting down", SUPERSEDED, reason)
+        self.counters["fenced"] += 1
+        self.fenced.set()
+        self._running = False
+        for r in list(self.active.values()) + list(self.admission):
+            self._finish(r, pb.FAILED, f"{SUPERSEDED}: {reason}", release=False, log_it=False)
 
     def now(self) -> float:
         return time.monotonic() - self.t0
@@ -174,12 +317,23 @@ class Coordinator:
     # ------------------------------------------------------------------ admission
     def submit(self, prompt_ids: list[int], max_new_tokens: int, client_id: str = "",
                timeout_s: float = 0.0) -> Request:
+        if self.fenced.is_set():
+            raise OverloadedError(f"{SUPERSEDED}: a newer coordinator has taken over")
         if not self._running:
             raise OverloadedError("coordinator not running")
         if len(self.admission) >= self.cfg.admission_queue_size:
             self.counters["rejected_overloaded"] += 1
             raise OverloadedError(f"admission queue full ({self.cfg.admission_queue_size})")
-        r = Request(client_id, prompt_ids, max_new_tokens, timeout_s or self.cfg.request_timeout_s)
+        timeout_s = timeout_s or self.cfg.request_timeout_s
+        r = Request(client_id, prompt_ids, max_new_tokens, timeout_s)
+        if self.rlog is not None:
+            # Log before admitting, so no token of this request can be committed before its prompt.
+            try:
+                self.rlog.start(r.client_id, r.id, r.prompt, r.max_new, time.time() + timeout_s)
+            except FencedError as e:
+                self._fence(str(e))
+                raise OverloadedError(f"{SUPERSEDED}: {e}")
+            r.logged = True
         self.admission.append(r)
         self.by_client[r.client_id] = r
         self.counters["submitted"] += 1
@@ -206,12 +360,26 @@ class Coordinator:
         self.counters["cancelled"] += 1
         return True
 
-    def _finish(self, r: Request, status: int, detail: str = "", release: bool = True) -> None:
+    def _finish(self, r: Request, status: int, detail: str = "", release: bool = True,
+                log_it: bool = True) -> None:
         if r.done:
             return
+        if log_it and r.logged and not r.logged_final and self.rlog is not None:
+            # Commit the terminal status before the client can see it.
+            try:
+                self.rlog.finish(r.client_id, status, detail)
+                r.logged_final = True
+            except FencedError as e:
+                self._fence(str(e))
+                return
+            except Exception as e:  # pragma: no cover - disk full etc.; the request still ends
+                log.error("request log: could not record the end of %s: %r", r.client_id, e)
         r.done = True
         r.status = status
         r.detail = detail
+        r.t_done = time.monotonic()
+        self._restore_pending.discard(r.id)
+        self._check_restore_done()
         self.active.pop(r.id, None)
         if self.by_client.get(r.client_id) is r:
             del self.by_client[r.client_id]
@@ -219,11 +387,7 @@ class Coordinator:
             self.admission.remove(r)
         except ValueError:
             pass
-        now = time.monotonic()
-        r.events.put_nowait(pb.GenerateChunk(
-            request_id=r.client_id, status=status, final=True, detail=detail,
-            ttft_ms=((r.t_first - (r.t_admit or r.t_submit)) * 1e3) if r.t_first else 0.0,
-            total_ms=(now - r.t_submit) * 1e3, token_ids=r.generated))
+        r.changed.set()
         self.counters[f"finished_{pb.RequestStatus.Name(status).lower()}"] += 1
         # Free KV caches if the workers may still hold state for this request.
         if release and status != pb.COMPLETED and (r.next_step > 0 or r.in_flight_batch is not None):
@@ -233,7 +397,8 @@ class Coordinator:
     async def _release_everywhere(self, ids: list[str]) -> None:
         for stub in self.stubs:
             try:
-                await stub.Release(pb.ReleaseRequest(request_ids=ids), timeout=self.cfg.rpc_timeout_s)
+                await stub.Release(pb.ReleaseRequest(request_ids=ids, coordinator_epoch=self.coord_epoch),
+                                   timeout=self.cfg.rpc_timeout_s)
             except grpc.aio.AioRpcError:
                 pass  # a dead worker has no cache to free; TTL eviction covers the rest
 
@@ -300,7 +465,8 @@ class Coordinator:
     async def _run_batch(self, bid: int, batch: list[Request]) -> None:
         epochs = list(self.epochs)
         items = [self._build_item(r) for r in batch]
-        msg = pb.ForwardRequest(stage_epochs=epochs, batch_id=bid, items=items)
+        msg = pb.ForwardRequest(stage_epochs=epochs, batch_id=bid, items=items,
+                                coordinator_epoch=self.coord_epoch)
         t0 = time.monotonic()
         resp, err = None, None
         try:
@@ -352,6 +518,7 @@ class Coordinator:
 
         by_id = {r.id: r for r in batch}
         seen = set()
+        accepted: list[tuple[Request, int]] = []
         for res in resp.results:
             r = by_id.get(res.request_id)
             if r is None or r.done or r.in_flight_batch != bid or duplicate:
@@ -365,10 +532,13 @@ class Coordinator:
             if res.status == pb.OK:
                 if res.replayed:
                     self.counters["idempotent_replays"] += 1
-                self._accept(r, res.token_id)
+                accepted.append((r, res.token_id))
                 continue
             name = pb.ItemStatus.Name(res.status)
             self.counters[f"item_{name}"] += 1
+            if res.status == pb.STALE_COORDINATOR:
+                self._fence(res.detail or "a worker rejected this coordinator's epoch")
+                return
             if res.status in _CONNECTIVITY:
                 self._retry_after_connectivity_failure(r)
                 continue
@@ -382,10 +552,36 @@ class Coordinator:
             else:  # transient
                 backoff = min(0.5, 0.01 * (2 ** min(r.retries, 6)))
                 asyncio.get_running_loop().call_later(backoff, self._make_ready, r)
+        if accepted and not self._commit_tokens(accepted):
+            return
+        for r, token in accepted:
+            self._accept(r, token)
         for r in batch:  # items missing from the response (should not happen): retry
             if r.id not in seen and r.in_flight_batch == bid:
                 r.in_flight_batch = None
                 self._make_ready(r)
+
+    def _commit_tokens(self, accepted: list[tuple[Request, int]]) -> bool:
+        """Write a micro-batch's tokens (and the completions they cause) to the request log in one
+        transaction, BEFORE any of them is streamed. Returns False if they must not be emitted."""
+        if self.rlog is None:
+            return True
+        tokens = [(r.client_id, r.next_step, tok) for r, tok in accepted if r.logged]
+        done = [(r.client_id, pb.COMPLETED, "") for r, _ in accepted if r.logged and r.next_step + 1 >= r.max_new]
+        try:
+            self.rlog.record(tokens, done)
+        except FencedError as e:
+            self._fence(str(e))
+            return False
+        except Exception as e:  # pragma: no cover - disk full etc.: cannot promise durability
+            log.error("request log write failed: %r", e)
+            for r, _ in accepted:
+                self._finish(r, pb.FAILED, f"request log write failed: {e!r}", log_it=False)
+            return False
+        for r, _ in accepted:
+            if r.logged and r.next_step + 1 >= r.max_new:
+                r.logged_final = True
+        return True
 
     def _retry_after_connectivity_failure(self, r: Request) -> None:
         """Retry the same step with exponential backoff (20 ms .. 250 ms). Not counted against
@@ -402,20 +598,25 @@ class Coordinator:
             if r.recovering_since is not None:
                 r.recovering_since = None
                 self._replay_done(r)
-        step = r.next_step
+            if r.id in self._restore_pending:
+                self._restore_pending.discard(r.id)
+                self._check_restore_done()
         r.generated.append(token)
         r.next_step += 1
         if r.t_first is None:
             r.t_first = now
         r.token_times.append(now)
         self.counters["tokens_generated"] += 1
-        text = self.tokenizer.decode([token]) if self.tokenizer is not None else ""
-        r.events.put_nowait(pb.GenerateChunk(request_id=r.client_id, step=step, token_id=token, text=text,
-                                             status=pb.RUNNING))
+        r.changed.set()
         if r.next_step >= r.max_new:
             self._finish(r, pb.COMPLETED)
         else:
             self._make_ready(r)
+
+    def _check_restore_done(self) -> None:
+        if not self._restore_pending and self.startup.get("restored") and "replayed" not in self.startup:
+            self.startup["replayed"] = time.time()
+            log.warning("every restored request has rebuilt its KV caches and produced a new token")
 
     def _record_batch(self, bid, items, msg, resp, t0, t1) -> None:
         self.batch_sizes.append(len(items))
@@ -442,9 +643,11 @@ class Coordinator:
         self.batch_log.append(rec)
 
     # ------------------------------------------------------------------ failure detection / recovery
-    async def _ping(self, stage: int) -> pb.HealthResponse | None:
+    async def _ping(self, stage: int, timeout: float | None = None) -> pb.HealthResponse | None:
+        # Heartbeats carry this incarnation's epoch: a worker that sees it fences off older coordinators.
         try:
-            return await self.stubs[stage].Health(pb.HealthRequest(), timeout=self.cfg.heartbeat_rpc_timeout_s)
+            return await self.stubs[stage].Health(pb.HealthRequest(coordinator_epoch=self.coord_epoch),
+                                                  timeout=timeout or self.cfg.heartbeat_rpc_timeout_s)
         except grpc.aio.AioRpcError:
             return None
 
@@ -463,6 +666,10 @@ class Coordinator:
             replies = await asyncio.gather(*[self._ping(s) for s in range(cfg.num_stages)])
             now = time.monotonic()
             for s, h in enumerate(replies):
+                if h is not None and h.coordinator_epoch > self.coord_epoch:
+                    self._fence(f"stage {s} has seen coordinator epoch {h.coordinator_epoch} "
+                                f"(this coordinator: {self.coord_epoch})")
+                    return
                 if s in self._recovering:
                     continue
                 if h is not None:
@@ -528,6 +735,7 @@ class Coordinator:
             return
         self.epochs[stage] = new_epoch
         self.last_heartbeat[stage] = time.monotonic()
+        self._save_worker_epochs()
         ev.update({"new_epoch": new_epoch, "restarted_t": self.now(), "restart_attempts": attempt,
                    "pending_replays": {r.id for r in self.active.values() if r.recovering_since is not None}})
         if not ev["pending_replays"]:
@@ -560,9 +768,17 @@ class Coordinator:
             ev["result"] = "recovered"
 
     async def _reaper_loop(self) -> None:
-        """Enforce request-level timeouts and the recovery deadline."""
+        """Enforce request-level timeouts and the recovery deadline; prune the request log."""
+        next_gc = time.monotonic() + 60.0
         while self._running:
             now = time.monotonic()
+            if self.rlog is not None and now > next_gc:
+                next_gc = now + 60.0
+                try:
+                    self.rlog.gc()
+                except FencedError as e:
+                    self._fence(str(e))
+                    return
             for r in list(self.active.values()) + list(self.admission):
                 if now > r.deadline:
                     self._finish(r, pb.TIMEOUT, "request timeout")
@@ -576,6 +792,10 @@ class Coordinator:
         out = {
             "t": self.now(), "t0_monotonic": self.t0, "window_s": time.monotonic() - self.metrics_t0,
             "config": self.cfg.to_dict(), "epochs": self.epochs, "addrs": self.addrs,
+            "coordinator_epoch": self.coord_epoch, "pid": os.getpid(), "fenced": self.fenced.is_set(),
+            "startup": self.startup,
+            "request_log": ({"path": self.rlog.path, **self.rlog.stats.as_dict(), **self.rlog.counts()}
+                            if self.rlog is not None and not self.fenced.is_set() else None),
             "admission_depth": len(self.admission), "admission_capacity": self.cfg.admission_queue_size,
             "active": len(self.active), "active_capacity": self.cfg.max_active,
             "ready": len(self.ready), "inflight_batches": self.inflight,
@@ -639,18 +859,65 @@ class CoordinatorServicer(pb_grpc.CoordinatorServiceServicer):
         try:
             r = c.submit(ids, max_new, request.request_id, request.timeout_s)
         except OverloadedError as e:
-            yield pb.GenerateChunk(request_id=request.request_id, final=True, status=pb.OVERLOADED,
-                                   detail=str(e))
+            status = pb.FAILED if str(e).startswith(SUPERSEDED) else pb.OVERLOADED
+            yield pb.GenerateChunk(request_id=request.request_id, final=True, status=status, detail=str(e))
             return
+        async for chunk in self._stream(r, 0):
+            yield chunk
+
+    async def Resume(self, request: pb.ResumeRequest, context):
+        """Re-attach to a request after a broken stream: tokens from `from_step` on, then the final chunk.
+        Works for requests a restarted coordinator restored from the log, and for finished requests
+        that are still in the log (their final chunk may have been lost with the old coordinator)."""
+        c = self.c
+        cid, start = request.request_id, request.from_step
+        r = c.by_client.get(cid)
+        if r is not None:
+            if not 0 <= start <= len(r.generated):
+                yield pb.GenerateChunk(request_id=cid, final=True, status=pb.INVALID,
+                                       detail=f"from_step {start} > {len(r.generated)} tokens generated")
+                return
+            c.counters["resumed_streams"] += 1
+            async for chunk in self._stream(r, start):
+                yield chunk
+            return
+        lr = c.rlog.lookup(cid) if c.rlog is not None else None
+        if lr is None or lr.status == pb.RUNNING or not 0 <= start <= len(lr.tokens):
+            yield pb.GenerateChunk(request_id=cid, final=True, status=pb.NOT_FOUND,
+                                   detail="unknown request (not in the request log)")
+            return
+        c.counters["resumed_finished"] += 1
+        for step in range(start, len(lr.tokens)):
+            yield self._token_chunk(cid, step, lr.tokens[step])
+        yield pb.GenerateChunk(request_id=cid, final=True, status=lr.status, detail=lr.detail,
+                               token_ids=lr.tokens)
+
+    def _token_chunk(self, client_id: str, step: int, token: int) -> pb.GenerateChunk:
+        tok = self.c.tokenizer
+        return pb.GenerateChunk(request_id=client_id, step=step, token_id=token, status=pb.RUNNING,
+                                text=tok.decode([token]) if tok is not None else "")
+
+    async def _stream(self, r: Request, sent: int):
+        """Stream r's tokens from step `sent`, then its final chunk. Several streams may follow the same
+        request (e.g. a stale one and a resumed one); each reads the shared state."""
         try:
             while True:
-                chunk = await r.events.get()
-                yield chunk
-                if chunk.final:
+                while sent < len(r.generated):
+                    yield self._token_chunk(r.client_id, sent, r.generated[sent])
+                    sent += 1
+                if r.done:
+                    yield pb.GenerateChunk(
+                        request_id=r.client_id, status=r.status, final=True, detail=r.detail,
+                        ttft_ms=((r.t_first - (r.t_admit or r.t_submit)) * 1e3) if r.t_first else 0.0,
+                        total_ms=((r.t_done or time.monotonic()) - r.t_submit) * 1e3, token_ids=r.generated)
                     return
+                r.changed.clear()
+                if sent < len(r.generated) or r.done:
+                    continue
+                await r.changed.wait()
         finally:
-            if not r.done:  # client went away / cancelled the stream
-                await c.cancel(r.client_id, "client cancelled the stream")
+            if not r.done and not self.c.fenced.is_set():  # client went away / cancelled the stream
+                await self.c.cancel(r.client_id, "client cancelled the stream")
 
     async def Cancel(self, request, context):
         return pb.CancelResponse(cancelled=await self.c.cancel(request.request_id))
@@ -689,9 +956,14 @@ async def serve(cfg: CoordinatorConfig) -> None:
     try:
         await coord.start()
         await server.start()
-        log.info("COORDINATOR READY on %s:%d (pid %d)", cfg.host, cfg.port, os.getpid())
+        coord.startup["serving"] = time.time()
+        log.info("COORDINATOR READY on %s:%d (pid %d, epoch %d)", cfg.host, cfg.port, os.getpid(),
+                 coord.coord_epoch)
         print(f"COORDINATOR READY {cfg.host}:{cfg.port}", flush=True)
-        await stop.wait()
+        waiters = [asyncio.create_task(stop.wait()), asyncio.create_task(coord.fenced.wait())]
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        for w in waiters:
+            w.cancel()
     finally:
         await server.stop(grace=0.5)
         await coord.stop()
@@ -723,6 +995,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--failure-timeout", type=float, default=d.failure_timeout_s)
     ap.add_argument("--recovery-deadline", type=float, default=d.recovery_deadline_s)
     ap.add_argument("--duplicate-dispatch", action="store_true", help="fault injection: send every batch twice")
+    ap.add_argument("--request-log", default=d.request_log,
+                    help="SQLite file for coordinator crash recovery (unfinished requests resume after a restart)")
+    ap.add_argument("--request-log-sync", default=d.request_log_sync, choices=["normal", "full", "off"],
+                    help="normal: survives a process crash; full: also a power loss")
+    ap.add_argument("--request-log-retention", type=float, default=d.request_log_retention_s,
+                    help="seconds a finished request stays resumable")
+    ap.add_argument("--detach-workers", action="store_true",
+                    help="spawned workers survive a coordinator crash and are adopted on restart")
+    ap.add_argument("--worker-orphan-timeout", type=float, default=d.worker_orphan_timeout_s,
+                    help="detached workers exit after this many seconds without a coordinator")
     ap.add_argument("--log-level", default="INFO")
     return ap
 
@@ -737,7 +1019,10 @@ def config_from_args(a) -> CoordinatorConfig:
         kv_cache=not a.no_kv_cache, max_batch_size=a.max_batch_size, max_wait_ms=a.max_wait_ms,
         max_inflight_batches=a.max_inflight, rpc_timeout_s=a.rpc_timeout, request_timeout_s=a.request_timeout,
         heartbeat_interval_s=a.heartbeat_interval, failure_timeout_s=a.failure_timeout,
-        recovery_deadline_s=a.recovery_deadline, duplicate_dispatch=a.duplicate_dispatch)
+        recovery_deadline_s=a.recovery_deadline, duplicate_dispatch=a.duplicate_dispatch,
+        request_log=a.request_log, request_log_sync=a.request_log_sync,
+        request_log_retention_s=a.request_log_retention, detach_workers=a.detach_workers,
+        worker_orphan_timeout_s=a.worker_orphan_timeout)
 
 
 def main(argv=None) -> None:

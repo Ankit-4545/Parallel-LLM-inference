@@ -306,6 +306,10 @@ def main(argv=None) -> int:
         from scripts.fault_inject import main as fault_main
 
         fault_main(["stale"])
+    if want("e10"):
+        from scripts.fault_inject import main as fault_main
+
+        fault_main(["coordinator", "--reps", str(reps)])
     if want("e9"):
         write_csv("e9_network_delay.csv", asyncio.run(e9(reps, a.quick)))
     if want("plen"):

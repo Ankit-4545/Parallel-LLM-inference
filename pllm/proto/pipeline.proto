@@ -39,6 +39,7 @@ enum ItemStatus {
   QUEUE_FULL = 9;             // worker input queue is full (backpressure)
   DOWNSTREAM_UNAVAILABLE = 10;// the next stage could not be reached
   INTERNAL_ERROR = 11;
+  STALE_COORDINATOR = 12;     // sent by a coordinator that a newer coordinator incarnation has replaced
 }
 
 // One request's contribution to a micro-batch.
@@ -80,6 +81,9 @@ message ForwardRequest {
   repeated int64 stage_epochs = 1;  // the epoch the sender believes each stage has
   int64 batch_id = 2;
   repeated StageItem items = 3;
+  // Epoch of the coordinator incarnation that sent this message. A worker remembers the highest
+  // value it has seen and rejects lower ones with STALE_COORDINATOR. 0 = unfenced (admin/test tools).
+  int64 coordinator_epoch = 4;
 }
 
 message ForwardResponse {
@@ -88,7 +92,9 @@ message ForwardResponse {
   int64 worker_epoch = 3;    // epoch of the stage that produced this response
 }
 
-message HealthRequest {}
+message HealthRequest {
+  int64 coordinator_epoch = 1;      // heartbeats also announce (and claim) the coordinator epoch
+}
 message HealthResponse {
   int32 stage = 1;
   int64 epoch = 2;
@@ -96,9 +102,15 @@ message HealthResponse {
   int32 queue_depth = 4;
   int32 cached_requests = 5;
   bool ready = 6;
+  int64 coordinator_epoch = 7;      // highest coordinator epoch this worker has seen
+  int32 num_stages = 8;             // lets a restarted coordinator check that it may adopt this worker
+  string split = 9;
 }
 
-message ReleaseRequest { repeated string request_ids = 1; }
+message ReleaseRequest {
+  repeated string request_ids = 1;
+  int64 coordinator_epoch = 2;
+}
 message ReleaseResponse { int32 released = 1; }
 
 // Admin / observability messages carry JSON to keep the schema small.
@@ -125,6 +137,7 @@ enum RequestStatus {
   CANCELLED = 4;
   FAILED = 5;       // unrecoverable failure (e.g. worker could not be recovered before the deadline)
   INVALID = 6;
+  NOT_FOUND = 7;    // Resume: no such request (never logged, or finished and garbage-collected)
 }
 
 message GenerateRequest {
@@ -149,11 +162,19 @@ message GenerateChunk {
   repeated int64 token_ids = 10;    // set on final chunk: the full generated sequence
 }
 
+// Re-attach to a request after the stream broke (e.g. the coordinator crashed and restarted).
+// The coordinator streams the tokens from `from_step` on, then the final chunk.
+message ResumeRequest {
+  string request_id = 1;
+  int64 from_step = 2;              // number of tokens the client already has
+}
+
 message CancelRequest { string request_id = 1; }
 message CancelResponse { bool cancelled = 1; }
 
 service CoordinatorService {
   rpc Generate(GenerateRequest) returns (stream GenerateChunk);
+  rpc Resume(ResumeRequest) returns (stream GenerateChunk);
   rpc Cancel(CancelRequest) returns (CancelResponse);
   rpc Stats(JsonRequest) returns (JsonResponse);
 }

@@ -6,6 +6,10 @@ single dedicated compute thread, so all cache mutation is serialised.
 
 Validation rules for an item (request_id, attempt, step), in order:
 
+0. Coordinator epoch: the stage remembers the highest coordinator epoch it has
+   seen (from Forward and heartbeats). A message from a lower one comes from a
+   coordinator incarnation that has been replaced -> STALE_COORDINATOR.
+   0 means "unfenced" (admin and test tools) and skips this check.
 1. Epoch: the message's epoch for this stage must equal the worker's epoch.
    Lower  -> STALE_EPOCH  (a message from before a crash/restart)
    Higher -> FUTURE_EPOCH (meant for a newer incarnation of this stage)
@@ -25,6 +29,7 @@ Validation rules for an item (request_id, attempt, step), in order:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -77,14 +82,26 @@ class ExecutorStats:
 
 class StageExecutor:
     def __init__(self, module: StageModule, stage: int, epoch: int,
-                 max_cached_requests: int = 128, cache_ttl_s: float = 120.0):
+                 max_cached_requests: int = 128, cache_ttl_s: float = 120.0, coordinator_epoch: int = 0):
         self.module = module
         self.stage = stage
         self.epoch = epoch
+        self.coordinator_epoch = coordinator_epoch
+        self._coord_lock = threading.Lock()  # heartbeats update it on the event loop, Forward on the compute thread
         self.cache = KVCacheManager(module.num_local_layers, max_cached_requests, cache_ttl_s)
         self.stats = ExecutorStats()
 
     # ------------------------------------------------------------------
+    def observe_coordinator(self, epoch: int) -> bool:
+        """Record a coordinator epoch. Returns False if it is older than one already seen."""
+        if epoch <= 0:
+            return True
+        with self._coord_lock:
+            if epoch < self.coordinator_epoch:
+                return False
+            self.coordinator_epoch = epoch
+            return True
+
     def check_epoch(self, stage_epochs) -> int:
         if self.stage >= len(stage_epochs):
             return pb.STALE_EPOCH
@@ -95,11 +112,18 @@ class StageExecutor:
             return pb.FUTURE_EPOCH
         return pb.OK
 
-    def process(self, stage_epochs, items, decoded_hidden: list[torch.Tensor | None]) -> list[ItemOutcome]:
+    def process(self, stage_epochs, items, decoded_hidden: list[torch.Tensor | None],
+                coordinator_epoch: int = 0) -> list[ItemOutcome]:
         """Validate and execute a micro-batch. `decoded_hidden[i]` is item i's input
         activations (already deserialised) for stages > 0."""
         t0 = time.perf_counter()
         outcomes = [ItemOutcome(it.request_id, it.step, it.attempt) for it in items]
+        if not self.observe_coordinator(coordinator_epoch):
+            for o in outcomes:
+                o.status = pb.STALE_COORDINATOR
+                o.detail = (f"coordinator epoch {coordinator_epoch} replaced by {self.coordinator_epoch}")
+                self.stats.reject(pb.STALE_COORDINATOR)
+            return outcomes
         epoch_status = self.check_epoch(stage_epochs)
         if epoch_status != pb.OK:
             for o in outcomes:
@@ -240,5 +264,7 @@ class StageExecutor:
                 if ex.release_after:
                     self.cache.release(ex.request_id, reason="completed")
 
-    def release(self, request_ids) -> int:
+    def release(self, request_ids, coordinator_epoch: int = 0) -> int:
+        if not self.observe_coordinator(coordinator_epoch):
+            return 0
         return sum(self.cache.release(r) for r in request_ids)

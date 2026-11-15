@@ -1,0 +1,7 @@
+variant,rep,requests,max_new_tokens,tokens_before_kill,restored_requests,completed,correct,duplicate_tokens,missing_tokens,reconnects,adopted_stages,spawned_stages,process_start_ms,init_ms,workers_ms,log_load_ms,serving_ms,replay_ms,total_recovery_ms,client_gap_ms_mean,client_gap_ms_max,pids_kept
+adopt,0,12,32,116,12,12,12,0,0,12,2,0,153.186,264.589,2.70104,1.77693,422.579,196.299,618.878,623.807,625.006,True
+adopt,1,12,32,115,12,12,12,0,0,12,2,0,58.6543,191.795,2.65813,1.71494,255.148,174.169,429.317,396.042,427.322,True
+adopt,2,12,32,121,12,12,12,0,0,12,2,0,59.5348,198.972,2.76899,1.75905,263.351,176.775,440.126,407.848,436.995,True
+respawn,0,12,32,121,12,12,12,0,0,12,0,2,58.4791,242.416,1554.17,4.66919,1861.99,301.524,2163.51,2121.08,2161.21,False
+respawn,1,12,32,120,12,12,12,0,0,12,0,2,92.905,315.267,1909.05,5.20301,2324.38,587.118,2911.5,2878.13,2908.09,False
+respawn,2,12,32,121,12,12,12,0,0,12,0,2,87.8441,316.973,1964.54,4.55689,2375.67,709.921,3085.59,3040.31,3082.28,False

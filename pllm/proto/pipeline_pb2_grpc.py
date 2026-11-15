@@ -285,6 +285,11 @@ class CoordinatorServiceStub:
                 request_serializer=pllm_dot_proto_dot_pipeline__pb2.GenerateRequest.SerializeToString,
                 response_deserializer=pllm_dot_proto_dot_pipeline__pb2.GenerateChunk.FromString,
                 _registered_method=True)
+        self.Resume = channel.unary_stream(
+                '/pllm.CoordinatorService/Resume',
+                request_serializer=pllm_dot_proto_dot_pipeline__pb2.ResumeRequest.SerializeToString,
+                response_deserializer=pllm_dot_proto_dot_pipeline__pb2.GenerateChunk.FromString,
+                _registered_method=True)
         self.Cancel = channel.unary_unary(
                 '/pllm.CoordinatorService/Cancel',
                 request_serializer=pllm_dot_proto_dot_pipeline__pb2.CancelRequest.SerializeToString,
@@ -301,6 +306,12 @@ class CoordinatorServiceServicer:
     """Missing associated documentation comment in .proto file."""
 
     def Generate(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Resume(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -324,6 +335,11 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
             'Generate': grpc.unary_stream_rpc_method_handler(
                     servicer.Generate,
                     request_deserializer=pllm_dot_proto_dot_pipeline__pb2.GenerateRequest.FromString,
+                    response_serializer=pllm_dot_proto_dot_pipeline__pb2.GenerateChunk.SerializeToString,
+            ),
+            'Resume': grpc.unary_stream_rpc_method_handler(
+                    servicer.Resume,
+                    request_deserializer=pllm_dot_proto_dot_pipeline__pb2.ResumeRequest.FromString,
                     response_serializer=pllm_dot_proto_dot_pipeline__pb2.GenerateChunk.SerializeToString,
             ),
             'Cancel': grpc.unary_unary_rpc_method_handler(
@@ -363,6 +379,33 @@ class CoordinatorService:
             target,
             '/pllm.CoordinatorService/Generate',
             pllm_dot_proto_dot_pipeline__pb2.GenerateRequest.SerializeToString,
+            pllm_dot_proto_dot_pipeline__pb2.GenerateChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Resume(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/pllm.CoordinatorService/Resume',
+            pllm_dot_proto_dot_pipeline__pb2.ResumeRequest.SerializeToString,
             pllm_dot_proto_dot_pipeline__pb2.GenerateChunk.FromString,
             options,
             channel_credentials,

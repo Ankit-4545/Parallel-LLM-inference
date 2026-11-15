@@ -16,6 +16,16 @@ Concurrency model
 * The number of Forward calls queued for / holding the compute thread is
   bounded by `queue_size`; beyond that the call is answered immediately with
   OVERLOADED (backpressure, never a silent drop).
+
+Lifetime
+--------
+* Spawned with --parent-pid (default): the worker exits when the coordinator
+  that spawned it dies.
+* Detached (--orphan-timeout > 0, no --parent-pid): the worker survives a
+  coordinator crash so a restarted coordinator can adopt it, and exits only if
+  no coordinator has contacted it for --orphan-timeout seconds.
+* Every message carries the sender's coordinator epoch; once a worker has seen
+  epoch N it rejects anything from an older coordinator (STALE_COORDINATOR).
 """
 
 from __future__ import annotations
@@ -56,7 +66,9 @@ class StageServicer(pb_grpc.StageServiceServicer):
     def __init__(self, cfg: WorkerConfig, module: StageModule):
         self.cfg = cfg
         self.module = module
-        self.executor = StageExecutor(module, cfg.stage, cfg.epoch, cfg.max_cached_requests, cfg.cache_ttl_s)
+        self.executor = StageExecutor(module, cfg.stage, cfg.epoch, cfg.max_cached_requests, cfg.cache_ttl_s,
+                                      coordinator_epoch=cfg.coordinator_epoch)
+        self.last_contact = time.monotonic()
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"stage{cfg.stage}-compute")
         self.wire_dtype = dtype_from_name(cfg.activation_dtype)
         self.link_delay_ms = cfg.link_delay_ms
@@ -92,7 +104,8 @@ class StageServicer(pb_grpc.StageServiceServicer):
                 if it.HasField("hidden"):
                     hidden_in[i] = proto_to_tensor(it.hidden, out_dtype=torch.float32)
         t1 = time.perf_counter()
-        outcomes = self.executor.process(request.stage_epochs, request.items, hidden_in)
+        outcomes = self.executor.process(request.stage_epochs, request.items, hidden_in,
+                                         coordinator_epoch=request.coordinator_epoch)
         t2 = time.perf_counter()
         next_req = None
         if self.next_stub is not None:
@@ -104,8 +117,8 @@ class StageServicer(pb_grpc.StageServiceServicer):
                         use_cache=it.use_cache, release_after=it.release_after,
                         hidden=tensor_to_proto(o.hidden, self.wire_dtype)))
             if items:
-                next_req = pb.ForwardRequest(stage_epochs=request.stage_epochs,
-                                             batch_id=request.batch_id, items=items)
+                next_req = pb.ForwardRequest(stage_epochs=request.stage_epochs, batch_id=request.batch_id,
+                                             items=items, coordinator_epoch=request.coordinator_epoch)
         t3 = time.perf_counter()
         self.busy_s += t3 - t0
         timing = pb.StageTiming(stage=self.cfg.stage, queue_ms=queue_ms, compute_ms=(t2 - t1) * 1e3,
@@ -113,6 +126,7 @@ class StageServicer(pb_grpc.StageServiceServicer):
         return outcomes, next_req, timing
 
     async def Forward(self, request: pb.ForwardRequest, context) -> pb.ForwardResponse:
+        self.last_contact = time.monotonic()
         bytes_in = request.ByteSize()
         self.bytes_in += bytes_in
         self.forward_calls += 1
@@ -186,13 +200,18 @@ class StageServicer(pb_grpc.StageServiceServicer):
             timing.downstream_ms = (time.perf_counter() - t0) * 1e3
 
     async def Health(self, request, context) -> pb.HealthResponse:
+        if request.coordinator_epoch:
+            self.last_contact = time.monotonic()
+            self.executor.observe_coordinator(request.coordinator_epoch)
         return pb.HealthResponse(stage=self.cfg.stage, epoch=self.cfg.epoch, pid=os.getpid(),
                                  queue_depth=self.pending, cached_requests=len(self.executor.cache),
-                                 ready=True)
+                                 ready=True, coordinator_epoch=self.executor.coordinator_epoch,
+                                 num_stages=self.cfg.num_stages, split=self.cfg.split)
 
     async def Release(self, request, context) -> pb.ReleaseResponse:
         loop = asyncio.get_running_loop()
-        n = await loop.run_in_executor(self.pool, self.executor.release, list(request.request_ids))
+        n = await loop.run_in_executor(self.pool, self.executor.release, list(request.request_ids),
+                                       request.coordinator_epoch)
         return pb.ReleaseResponse(released=n)
 
     async def Stats(self, request, context) -> pb.JsonResponse:
@@ -201,6 +220,7 @@ class StageServicer(pb_grpc.StageServiceServicer):
         wall = time.monotonic() - self.started
         out = {
             "stage": self.cfg.stage, "epoch": self.cfg.epoch, "pid": os.getpid(),
+            "coordinator_epoch": self.executor.coordinator_epoch,
             "layers": [self.module.layer_start, self.module.layer_end],
             "param_bytes": self.module.param_bytes(), "rss_bytes": _rss_bytes(),
             "wall_s": wall, "busy_s": self.busy_s, "utilisation": self.busy_s / wall if wall > 0 else 0.0,
@@ -261,10 +281,21 @@ async def serve(cfg: WorkerConfig) -> None:
             if os.getppid() != cfg.parent_pid:
                 log.warning("parent %d exited; shutting down", cfg.parent_pid)
                 stop.set()
+            await asyncio.sleep(0.2)
+
+    async def watch_orphan() -> None:
+        # Detached worker: outlive a coordinator crash, but not forever.
+        while not stop.is_set():
+            idle = time.monotonic() - servicer.last_contact
+            if idle > cfg.orphan_timeout_s:
+                log.warning("no coordinator contact for %.0f s; shutting down", idle)
+                stop.set()
             await asyncio.sleep(1.0)
 
     if cfg.parent_pid:
         asyncio.create_task(watch_parent())
+    if cfg.orphan_timeout_s > 0:
+        asyncio.create_task(watch_orphan())
     await stop.wait()
     await server.stop(grace=0.5)
     if servicer.next_channel is not None:
@@ -289,6 +320,10 @@ def main(argv=None) -> None:
     ap.add_argument("--link-delay-ms", type=float, default=0.0)
     ap.add_argument("--model", default=WorkerConfig.model_name)
     ap.add_argument("--parent-pid", type=int, default=0, help="exit when this process exits (set by the supervisor)")
+    ap.add_argument("--coordinator-epoch", type=int, default=0,
+                    help="reject messages from coordinator incarnations older than this")
+    ap.add_argument("--orphan-timeout", type=float, default=0.0,
+                    help="exit after this many seconds without coordinator contact (0 = never)")
     ap.add_argument("--log-level", default="INFO")
     a = ap.parse_args(argv)
     logging.basicConfig(level=a.log_level, format=f"%(asctime)s [stage{a.stage}] %(levelname)s %(message)s")
@@ -297,7 +332,8 @@ def main(argv=None) -> None:
                        host=a.host, model_name=a.model, threads=a.threads, queue_size=a.queue_size,
                        max_cached_requests=a.max_cached_requests, cache_ttl_s=a.cache_ttl,
                        activation_dtype=a.activation_dtype, link_delay_ms=a.link_delay_ms,
-                       parent_pid=a.parent_pid)
+                       parent_pid=a.parent_pid, coordinator_epoch=a.coordinator_epoch,
+                       orphan_timeout_s=a.orphan_timeout)
     asyncio.run(serve(cfg))
 
 

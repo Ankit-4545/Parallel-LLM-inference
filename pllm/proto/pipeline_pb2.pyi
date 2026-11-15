@@ -21,6 +21,7 @@ class ItemStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     QUEUE_FULL: _ClassVar[ItemStatus]
     DOWNSTREAM_UNAVAILABLE: _ClassVar[ItemStatus]
     INTERNAL_ERROR: _ClassVar[ItemStatus]
+    STALE_COORDINATOR: _ClassVar[ItemStatus]
 
 class RequestStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -31,6 +32,7 @@ class RequestStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CANCELLED: _ClassVar[RequestStatus]
     FAILED: _ClassVar[RequestStatus]
     INVALID: _ClassVar[RequestStatus]
+    NOT_FOUND: _ClassVar[RequestStatus]
 OK: ItemStatus
 STALE_EPOCH: ItemStatus
 FUTURE_EPOCH: ItemStatus
@@ -43,6 +45,7 @@ CACHE_FULL: ItemStatus
 QUEUE_FULL: ItemStatus
 DOWNSTREAM_UNAVAILABLE: ItemStatus
 INTERNAL_ERROR: ItemStatus
+STALE_COORDINATOR: ItemStatus
 RUNNING: RequestStatus
 COMPLETED: RequestStatus
 OVERLOADED: RequestStatus
@@ -50,6 +53,7 @@ TIMEOUT: RequestStatus
 CANCELLED: RequestStatus
 FAILED: RequestStatus
 INVALID: RequestStatus
+NOT_FOUND: RequestStatus
 
 class Tensor(_message.Message):
     __slots__ = ("shape", "dtype", "data")
@@ -124,14 +128,16 @@ class StageTiming(_message.Message):
     def __init__(self, stage: _Optional[int] = ..., queue_ms: _Optional[float] = ..., compute_ms: _Optional[float] = ..., deserialize_ms: _Optional[float] = ..., serialize_ms: _Optional[float] = ..., downstream_ms: _Optional[float] = ..., bytes_in: _Optional[int] = ..., bytes_out: _Optional[int] = ..., link_delay_ms: _Optional[float] = ...) -> None: ...
 
 class ForwardRequest(_message.Message):
-    __slots__ = ("stage_epochs", "batch_id", "items")
+    __slots__ = ("stage_epochs", "batch_id", "items", "coordinator_epoch")
     STAGE_EPOCHS_FIELD_NUMBER: _ClassVar[int]
     BATCH_ID_FIELD_NUMBER: _ClassVar[int]
     ITEMS_FIELD_NUMBER: _ClassVar[int]
+    COORDINATOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
     stage_epochs: _containers.RepeatedScalarFieldContainer[int]
     batch_id: int
     items: _containers.RepeatedCompositeFieldContainer[StageItem]
-    def __init__(self, stage_epochs: _Optional[_Iterable[int]] = ..., batch_id: _Optional[int] = ..., items: _Optional[_Iterable[_Union[StageItem, _Mapping]]] = ...) -> None: ...
+    coordinator_epoch: int
+    def __init__(self, stage_epochs: _Optional[_Iterable[int]] = ..., batch_id: _Optional[int] = ..., items: _Optional[_Iterable[_Union[StageItem, _Mapping]]] = ..., coordinator_epoch: _Optional[int] = ...) -> None: ...
 
 class ForwardResponse(_message.Message):
     __slots__ = ("results", "timings", "worker_epoch")
@@ -144,30 +150,40 @@ class ForwardResponse(_message.Message):
     def __init__(self, results: _Optional[_Iterable[_Union[ItemResult, _Mapping]]] = ..., timings: _Optional[_Iterable[_Union[StageTiming, _Mapping]]] = ..., worker_epoch: _Optional[int] = ...) -> None: ...
 
 class HealthRequest(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...
+    __slots__ = ("coordinator_epoch",)
+    COORDINATOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    coordinator_epoch: int
+    def __init__(self, coordinator_epoch: _Optional[int] = ...) -> None: ...
 
 class HealthResponse(_message.Message):
-    __slots__ = ("stage", "epoch", "pid", "queue_depth", "cached_requests", "ready")
+    __slots__ = ("stage", "epoch", "pid", "queue_depth", "cached_requests", "ready", "coordinator_epoch", "num_stages", "split")
     STAGE_FIELD_NUMBER: _ClassVar[int]
     EPOCH_FIELD_NUMBER: _ClassVar[int]
     PID_FIELD_NUMBER: _ClassVar[int]
     QUEUE_DEPTH_FIELD_NUMBER: _ClassVar[int]
     CACHED_REQUESTS_FIELD_NUMBER: _ClassVar[int]
     READY_FIELD_NUMBER: _ClassVar[int]
+    COORDINATOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    NUM_STAGES_FIELD_NUMBER: _ClassVar[int]
+    SPLIT_FIELD_NUMBER: _ClassVar[int]
     stage: int
     epoch: int
     pid: int
     queue_depth: int
     cached_requests: int
     ready: bool
-    def __init__(self, stage: _Optional[int] = ..., epoch: _Optional[int] = ..., pid: _Optional[int] = ..., queue_depth: _Optional[int] = ..., cached_requests: _Optional[int] = ..., ready: _Optional[bool] = ...) -> None: ...
+    coordinator_epoch: int
+    num_stages: int
+    split: str
+    def __init__(self, stage: _Optional[int] = ..., epoch: _Optional[int] = ..., pid: _Optional[int] = ..., queue_depth: _Optional[int] = ..., cached_requests: _Optional[int] = ..., ready: _Optional[bool] = ..., coordinator_epoch: _Optional[int] = ..., num_stages: _Optional[int] = ..., split: _Optional[str] = ...) -> None: ...
 
 class ReleaseRequest(_message.Message):
-    __slots__ = ("request_ids",)
+    __slots__ = ("request_ids", "coordinator_epoch")
     REQUEST_IDS_FIELD_NUMBER: _ClassVar[int]
+    COORDINATOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
     request_ids: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, request_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+    coordinator_epoch: int
+    def __init__(self, request_ids: _Optional[_Iterable[str]] = ..., coordinator_epoch: _Optional[int] = ...) -> None: ...
 
 class ReleaseResponse(_message.Message):
     __slots__ = ("released",)
@@ -224,6 +240,14 @@ class GenerateChunk(_message.Message):
     total_ms: float
     token_ids: _containers.RepeatedScalarFieldContainer[int]
     def __init__(self, request_id: _Optional[str] = ..., step: _Optional[int] = ..., token_id: _Optional[int] = ..., text: _Optional[str] = ..., status: _Optional[_Union[RequestStatus, str]] = ..., final: _Optional[bool] = ..., detail: _Optional[str] = ..., ttft_ms: _Optional[float] = ..., total_ms: _Optional[float] = ..., token_ids: _Optional[_Iterable[int]] = ...) -> None: ...
+
+class ResumeRequest(_message.Message):
+    __slots__ = ("request_id", "from_step")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    FROM_STEP_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    from_step: int
+    def __init__(self, request_id: _Optional[str] = ..., from_step: _Optional[int] = ...) -> None: ...
 
 class CancelRequest(_message.Message):
     __slots__ = ("request_id",)

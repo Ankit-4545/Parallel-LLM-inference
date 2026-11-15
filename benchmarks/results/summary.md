@@ -100,6 +100,31 @@ Worker 2: mean total recovery 2096 ms (detection 548 + restart 1347 + replay 200
 - Every decode step delivered twice straight to the workers: duplicates answered from the idempotency cache = True; token stream matches reference = True; a late older step was answered with **STALE_STEP**.
 - Coordinator re-sent every micro-batch (65 duplicates): 505 duplicate results discarded, 0 duplicate tokens emitted, 16/16 responses exact; worker idempotent replays [512, 512].
 
+## E10 - coordinator crash (SIGKILL) mid-generation
+
+A new coordinator is started with the same `--request-log` right after the kill (the role systemd would play); clients re-attach with `Resume`. Times are from the SIGKILL.
+
+| workers | rep | exact match | dup tokens | missing tokens | restored requests | new process up (ms) | init (ms) | adopt/spawn workers (ms) | log load (ms) | serving (ms) | replay (ms) | all resumed (ms) | client gap max (ms) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| adopt | 0 | 12/12 | 0 | 0 | 12 | 153 | 265 | 3 | 1.8 | 423 | 196 | 619 | 625 |
+| adopt | 1 | 12/12 | 0 | 0 | 12 | 59 | 192 | 3 | 1.7 | 255 | 174 | 429 | 427 |
+| adopt | 2 | 12/12 | 0 | 0 | 12 | 60 | 199 | 3 | 1.8 | 263 | 177 | 440 | 437 |
+| respawn | 0 | 12/12 | 0 | 0 | 12 | 58 | 242 | 1554 | 4.7 | 1862 | 302 | 2164 | 2161 |
+| respawn | 1 | 12/12 | 0 | 0 | 12 | 93 | 315 | 1909 | 5.2 | 2324 | 587 | 2912 | 2908 |
+| respawn | 2 | 12/12 | 0 | 0 | 12 | 88 | 317 | 1965 | 4.6 | 2376 | 710 | 3086 | 3082 |
+
+Workers adopted: mean kill -> all requests resumed **496 ms** (new process 90 + init 218 + workers 3 + log 1.8 + replay 182, plus a few ms of gRPC start-up).
+
+Workers respawned: mean kill -> all requests resumed **2720 ms** (new process 80 + init 292 + workers 1809 + log 4.8 + replay 533, plus a few ms of gRPC start-up).
+
+### E10 - cost of the request log during normal operation
+
+| request log | single-request ITL (ms) | throughput @32 (tok/s) | ITL p50 @32 (ms) | commit mean (ms) | commit max (ms) | exact match |
+|---|---|---|---|---|---|---|
+| off | 23.59 | 230.8 | 128.20 | - | - | 100% |
+| WAL, synchronous=NORMAL | 22.53 | 233.4 | 125.00 | 0.133 | 3.95 | 100% |
+| WAL, synchronous=FULL + fullfsync | 27.62 | 226.1 | 129.68 | 4.007 | 12.29 | 100% |
+
 ## E9 - artificial delay between workers
 
 | delay (ms) | in flight | single-request ITL (ms) | throughput @32 (tok/s) | exact match |

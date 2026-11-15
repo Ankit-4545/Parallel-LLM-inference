@@ -239,6 +239,35 @@ def plot_recovery_timeline():
     _save(fig, "e6_e7_recovery_timeline.png")
 
 
+def plot_e10():
+    """Coordinator SIGKILL: token arrival per request, workers adopted vs respawned (rep 0)."""
+    tl, marks = read_csv("e10_timeline.csv"), read_csv("e10_marks.csv")
+    if not tl:
+        return
+    variants = [v for v in ("adopt", "respawn") if any(r["variant"] == v for r in tl)]
+    xmax = max(r["t_ms"] for r in tl if r["rep"] == 0)
+    fig, axes = plt.subplots(1, len(variants), figsize=(6.5 * len(variants), 3.8), squeeze=False, sharey=True, sharex=True)
+    titles = {"adopt": "Kill coordinator, workers adopted (--detach-workers)",
+              "respawn": "Kill coordinator, workers respawned"}
+    for ax, v in zip(axes[0], variants):
+        rows = [r for r in tl if r["variant"] == v and r["rep"] == 0]
+        for req in sorted({r["request"] for r in rows}):
+            pts = sorted((r["t_ms"], r["step"]) for r in rows if r["request"] == req)
+            # steps: a flat segment is a period with no tokens (the outage), not slow progress
+            ax.plot([p[0] for p in pts], [p[1] + 1 for p in pts], color=S1, lw=1, alpha=0.55, drawstyle="steps-post")
+        mk = next((m for m in marks if m["variant"] == v and m["rep"] == 0), None)
+        if mk:
+            for key, color, label in (("kill_ms", S2, "SIGKILL"), ("serving_ms", S3, "new coordinator serving"),
+                                      ("replayed_ms", INK2, "requests resumed")):
+                ax.axvline(mk[key], color=color, lw=1.5, ls="--", label=f"{label} ({mk[key]:.0f} ms)")
+        ax.set_xlim(right=xmax * 1.02)
+        ax.set_title(titles[v], loc="left")
+        ax.set_xlabel("time relative to SIGKILL (ms)")
+        ax.set_ylabel("tokens received per request")
+        ax.legend(loc="lower right")
+    _save(fig, "e10_coordinator_recovery.png")
+
+
 def plot_e9():
     rows = read_csv("e9_network_delay.csv")
     if not rows:
@@ -450,6 +479,42 @@ def summary_md() -> str:
                            f"responses exact; worker idempotent replays {dd['worker_idempotent_replays']}.")
             out.append("")
 
+    e10 = read_csv("e10_coordinator_recovery.csv")
+    if e10:
+        out += ["## E10 - coordinator crash (SIGKILL) mid-generation", "",
+                "A new coordinator is started with the same `--request-log` right after the kill (the role systemd "
+                "would play); clients re-attach with `Resume`. Times are from the SIGKILL.", "",
+                "| workers | rep | exact match | dup tokens | missing tokens | restored requests | new process up (ms) | "
+                "init (ms) | adopt/spawn workers (ms) | log load (ms) | serving (ms) | replay (ms) | all resumed (ms) | "
+                "client gap max (ms) |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for r in e10:
+            out.append(f"| {r['variant']} | {r['rep']} | {r['correct']}/{r['requests']} | {r['duplicate_tokens']} | "
+                       f"{r['missing_tokens']} | {r['restored_requests']} | {_f(r['process_start_ms'], 0)} | "
+                       f"{_f(r['init_ms'], 0)} | {_f(r['workers_ms'], 0)} | {_f(r['log_load_ms'], 1)} | "
+                       f"{_f(r['serving_ms'], 0)} | {_f(r['replay_ms'], 0)} | {_f(r['total_recovery_ms'], 0)} | "
+                       f"{_f(r['client_gap_ms_max'], 0)} |")
+        for v in ("adopt", "respawn"):
+            rs = [r for r in e10 if r["variant"] == v]
+            if rs:
+                out.append(f"\nWorkers {v}ed: mean kill -> all requests resumed **{_mean(rs, 'total_recovery_ms'):.0f} ms** "
+                           f"(new process {_mean(rs, 'process_start_ms'):.0f} + init {_mean(rs, 'init_ms'):.0f} + "
+                           f"workers {_mean(rs, 'workers_ms'):.0f} + log {_mean(rs, 'log_load_ms'):.1f} + replay "
+                           f"{_mean(rs, 'replay_ms'):.0f}, plus a few ms of gRPC start-up).")
+        out.append("")
+    ov = read_csv("e10_log_overhead.csv")
+    if ov:
+        out += ["### E10 - cost of the request log during normal operation", "",
+                "| request log | single-request ITL (ms) | throughput @32 (tok/s) | ITL p50 @32 (ms) | commit mean (ms) | commit max (ms) | exact match |",
+                "|---|---|---|---|---|---|---|"]
+        for r in aggregate(ov, ["single_itl_ms_mean", "conc32_throughput_tok_s", "conc32_itl_ms_p50", "commit_ms_mean",
+                                "commit_ms_max", "correct_rate"], ["log_mode"]):
+            name = {"none": "off", "normal": "WAL, synchronous=NORMAL", "full": "WAL, synchronous=FULL + fullfsync"}
+            out.append(f"| {name.get(r['log_mode'], r['log_mode'])} | {_f(r['single_itl_ms_mean'], 2)} | "
+                       f"{_f(r['conc32_throughput_tok_s'])} | {_f(r['conc32_itl_ms_p50'], 2)} | "
+                       f"{_f(r['commit_ms_mean'], 3)} | {_f(r['commit_ms_max'], 2)} | {_f(100 * r['correct_rate'], 0)}% |")
+        out.append("")
+
     e9 = read_csv("e9_network_delay.csv")
     if e9:
         out += ["## E9 - artificial delay between workers", "",
@@ -487,7 +552,8 @@ def summary_md() -> str:
 
 def main(argv=None) -> int:
     ensure_dirs()
-    for fn in (plot_e1, plot_e2, plot_e3, plot_e4, plot_overload, plot_recovery_timeline, plot_e9, plot_plen):
+    for fn in (plot_e1, plot_e2, plot_e3, plot_e4, plot_overload, plot_recovery_timeline, plot_e9, plot_plen,
+               plot_e10):
         try:
             fn()
         except Exception as e:  # keep going: one missing result should not block the rest
